@@ -6,6 +6,7 @@
 #include <WebSocketsServer.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
+#include <WiFiUdp.h>
 
 Adafruit_MPU6050 mpu;
 
@@ -20,7 +21,6 @@ ESP8266WebServer server(80);
 WebSocketsServer webSocket = WebSocketsServer(81);
 
 // DHCP сервер
-#include <WiFiUdp.h>
 WiFiUDP udp;
 const unsigned int DHCP_SERVER_PORT = 67;
 const unsigned int DHCP_CLIENT_PORT = 68;
@@ -63,6 +63,7 @@ struct NetworkSettings {
   bool apModeEnabled;
   char sta_ssid[32];
   char sta_password[32];
+  char device_comment[256];
 };
 
 // Sensor data
@@ -117,6 +118,9 @@ unsigned long lastWifiScan = 0;
 const unsigned long WIFI_SCAN_INTERVAL = 30000;
 bool scanningWifi = false;
 
+// Переменные для регистрации
+bool registrationAttempted = false;
+
 // Прототипы функций для DHCP
 void handleDHCPDiscover(DHCPMessage& discoverMsg);
 void handleDHCPRequest(DHCPMessage& requestMsg);
@@ -124,6 +128,7 @@ void sendDHCPOffer(DHCPMessage& discoverMsg, int ipIndex);
 void sendDHCPAck(DHCPMessage& requestMsg, const String& clientMAC);
 String macToString(uint8_t* mac);
 int getIPFromMAC(const String& mac);
+void attemptRegistration();
 
 // Безопасное копирование строк с проверкой границ
 void safeStrcpy(char* dest, const char* src, size_t destSize) {
@@ -557,18 +562,10 @@ int getIPFromMAC(const String& mac) {
 
 // Установка относительного нуля
 void setZeroPoint() {
-  zeroPitch = pitch;
-  zeroRoll = roll;
-  zeroYaw = yaw;
+  zeroPitch = accumulatedPitch;
+  zeroRoll = accumulatedRoll;
+  zeroYaw = accumulatedYaw;
   zeroSet = true;
-  
-  // Сбрасываем накопленные углы при установке нуля
-  accumulatedPitch = 0;
-  accumulatedRoll = 0;
-  accumulatedYaw = 0;
-  prevPitch = pitch;
-  prevRoll = roll;
-  prevYaw = yaw;
   
   Serial.println("Zero point set");
   Serial.print("Zero Pitch: "); Serial.print(zeroPitch);
@@ -579,24 +576,6 @@ void setZeroPoint() {
                    ",ROLL:" + String(zeroRoll, 2) + 
                    ",YAW:" + String(zeroYaw, 2);
   webSocket.broadcastTXT(message);
-}
-
-// Сброс относительного нуля
-void resetZeroPoint() {
-  zeroPitch = 0;
-  zeroRoll = 0;
-  zeroYaw = 0;
-  zeroSet = false;
-  
-  accumulatedPitch = 0;
-  accumulatedRoll = 0;
-  accumulatedYaw = 0;
-  prevPitch = pitch;
-  prevRoll = roll;
-  prevYaw = yaw;
-  
-  Serial.println("Zero point reset");
-  webSocket.broadcastTXT("ZERO_RESET");
 }
 
 // Расчет накопленных углов (без ограничений)
@@ -634,7 +613,7 @@ void updateAccumulatedAngles() {
   prevYaw = yaw;
 }
 
-// Получение относительных углов (без ограничений)
+// Получение относительных углов (бесконечные углы отклонения)
 double getRelativePitch() {
   if (!zeroSet) return accumulatedPitch;
   return accumulatedPitch - zeroPitch;
@@ -739,7 +718,14 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         else if (message == "RESET_ANGLES") {
           pitch = 0; roll = 0; yaw = 0;
           lastSentPitch = 0; lastSentRoll = 0; lastSentYaw = 0;
-          resetZeroPoint();
+          accumulatedPitch = 0;
+          accumulatedRoll = 0;
+          accumulatedYaw = 0;
+          prevPitch = 0;
+          prevRoll = 0;
+          prevYaw = 0;
+          firstMeasurement = true;
+          zeroSet = false;
           String resetMessage = "ANGLES_RESET";
           webSocket.broadcastTXT(resetMessage);
           sendSensorData();
@@ -747,10 +733,6 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         else if (message == "SET_ZERO") {
           setZeroPoint();
           webSocket.broadcastTXT("ZERO_POINT_SET");
-        }
-        else if (message == "RESET_ZERO") {
-          resetZeroPoint();
-          webSocket.broadcastTXT("ZERO_POINT_RESET");
         }
         else if (message == "SCAN_NETWORK") {
           scanNetwork();
@@ -779,6 +761,7 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
               settings["subnet"] = networkSettings.subnet;
               settings["sta_ssid"] = networkSettings.sta_ssid;
               settings["sta_password"] = networkSettings.sta_password;
+              settings["device_comment"] = networkSettings.device_comment;
               settings["ap_mode_enabled"] = networkSettings.apModeEnabled;
               
               String json;
@@ -801,6 +784,9 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
               }
               if (settings.containsKey("sta_password")) {
                 safeStrcpy(networkSettings.sta_password, settings["sta_password"], sizeof(networkSettings.sta_password));
+              }
+              if (settings.containsKey("device_comment")) {
+                safeStrcpy(networkSettings.device_comment, settings["device_comment"], sizeof(networkSettings.device_comment));
               }
               if (settings.containsKey("ap_mode_enabled")) {
                 networkSettings.apModeEnabled = settings["ap_mode_enabled"];
@@ -867,6 +853,14 @@ void saveNetworkSettingsToEEPROM() {
     EEPROM.write(addr++, networkSettings.sta_password[j]);
   }
   
+  // Сохраняем комментарий устройства
+  size_t commentLen = strlen(networkSettings.device_comment);
+  if (commentLen > 255) commentLen = 255;
+  EEPROM.write(addr++, commentLen);
+  for (size_t j = 0; j < commentLen; j++) {
+    EEPROM.write(addr++, networkSettings.device_comment[j]);
+  }
+  
   if (EEPROM.commit()) {
     Serial.println("Network settings saved to EEPROM");
   } else {
@@ -923,6 +917,14 @@ void loadNetworkSettingsFromEEPROM() {
       networkSettings.sta_password[j] = EEPROM.read(addr++);
     }
     networkSettings.sta_password[sta_passwordLen] = '\0';
+    
+    // Загружаем комментарий устройства
+    int commentLen = EEPROM.read(addr++);
+    if (commentLen > 255) commentLen = 255;
+    for (int j = 0; j < commentLen; j++) {
+      networkSettings.device_comment[j] = EEPROM.read(addr++);
+    }
+    networkSettings.device_comment[commentLen] = '\0';
   } else {
     // Значения по умолчанию
     safeStrcpy(networkSettings.ssid, ap_ssid, sizeof(networkSettings.ssid));
@@ -930,6 +932,7 @@ void loadNetworkSettingsFromEEPROM() {
     safeStrcpy(networkSettings.subnet, "50", sizeof(networkSettings.subnet));
     safeStrcpy(networkSettings.sta_ssid, "", sizeof(networkSettings.sta_ssid));
     safeStrcpy(networkSettings.sta_password, "", sizeof(networkSettings.sta_password));
+    safeStrcpy(networkSettings.device_comment, "", sizeof(networkSettings.device_comment));
     networkSettings.apModeEnabled = true;
   }
   
@@ -976,13 +979,6 @@ void handleSetZero() {
   server.send(200, "application/json", response);
 }
 
-void handleResetZero() {
-  addCORSHeaders();
-  resetZeroPoint();
-  String response = "{\"status\":\"ok\",\"message\":\"Zero point reset\"}";
-  server.send(200, "application/json", response);
-}
-
 void handleNetworkSettings() {
   addCORSHeaders();
   
@@ -1009,6 +1005,9 @@ void handleNetworkSettings() {
       if (settings.containsKey("sta_password")) {
         safeStrcpy(networkSettings.sta_password, settings["sta_password"], sizeof(networkSettings.sta_password));
       }
+      if (settings.containsKey("device_comment")) {
+        safeStrcpy(networkSettings.device_comment, settings["device_comment"], sizeof(networkSettings.device_comment));
+      }
       if (settings.containsKey("ap_mode_enabled")) {
         networkSettings.apModeEnabled = settings["ap_mode_enabled"];
       }
@@ -1034,12 +1033,69 @@ void handleGetNetworkSettings() {
   doc["subnet"] = networkSettings.subnet;
   doc["sta_ssid"] = networkSettings.sta_ssid;
   doc["sta_password"] = networkSettings.sta_password;
+  doc["device_comment"] = networkSettings.device_comment;
   doc["ap_mode_enabled"] = networkSettings.apModeEnabled;
   doc["configured"] = networkSettings.configured;
   
   String json;
   serializeJson(doc, json);
   server.send(200, "application/json", json);
+}
+
+// Функция для попытки регистрации на основном шлюзе
+void attemptRegistration() {
+  if (WiFi.status() == WL_CONNECTED && !registrationAttempted) {
+    registrationAttempted = true;
+    
+    // Получаем IP основного шлюза
+    IPAddress gateway = WiFi.gatewayIP();
+    
+    Serial.print("Attempting registration with gateway: ");
+    Serial.println(gateway.toString());
+    
+    // Отправляем HTTP POST запрос для регистрации
+    WiFiClient client;
+    if (client.connect(gateway, 80)) {
+      Serial.println("Connected to gateway for registration");
+      
+      // Формируем JSON данные для регистрации
+      DynamicJsonDocument doc(512);
+      doc["type"] = "device_registration";
+      doc["device_name"] = networkSettings.ssid;
+      doc["device_ip"] = WiFi.localIP().toString();
+      doc["device_mac"] = WiFi.macAddress();
+      doc["device_comment"] = networkSettings.device_comment;
+      
+      String json;
+      serializeJson(doc, json);
+      
+      // Отправляем HTTP POST запрос
+      client.println("POST /api/register_device HTTP/1.1");
+      client.println("Host: " + gateway.toString());
+      client.println("Content-Type: application/json");
+      client.println("Connection: close");
+      client.print("Content-Length: ");
+      client.println(json.length());
+      client.println();
+      client.println(json);
+      
+      Serial.println("Registration data sent via HTTP");
+      
+      // Ждем ответа
+      unsigned long timeout = millis();
+      while (client.connected() && millis() - timeout < 5000) {
+        if (client.available()) {
+          String line = client.readStringUntil('\n');
+          Serial.println(line);
+        }
+      }
+      
+      client.stop();
+      Serial.println("Registration completed");
+    } else {
+      Serial.println("Failed to connect to gateway for registration");
+    }
+  }
 }
 
 const char MAIN_page[] PROGMEM = R"rawliteral(
@@ -1092,6 +1148,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         .device-name { font-weight: bold; font-size: 1.1em; }
         .device-ip { color: #666; font-family: monospace; }
         .device-mac { color: #888; font-size: 0.9em; font-family: monospace; }
+        .device-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
         .status-online { background: #d4edda; color: #155724; }
         .status-offline { background: #f8d7da; color: #721c24; }
         
@@ -1100,7 +1157,8 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         .modal-content { background: white; margin: 50px auto; padding: 20px; border-radius: 8px; max-width: 500px; }
         .form-group { margin-bottom: 15px; }
         label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        input, select, textarea { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        textarea { height: 100px; resize: vertical; }
         .tab-buttons { display: flex; margin-bottom: 20px; }
         .tab-btn { padding: 10px 20px; background: #e9ecef; border: none; cursor: pointer; margin-right: 5px; }
         .tab-btn.active { background: #007bff; color: white; }
@@ -1123,6 +1181,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         <div class="header">
             <h1>VR Head Tracker - MPU6050 Sensor Data</h1>
             <p>Real-time 3D orientation visualization and network monitoring</p>
+            <p><strong>Access Point:</strong> <span id="ap-name">VR_Head_Hom_001</span></p>
         </div>
         
         <div class="stats">
@@ -1193,9 +1252,8 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         </div>
 
         <div class="zero-controls">
-            <h3>Zero Point Control</h3>
+            <h3>Angle Control</h3>
             <button class="btn-success" onclick="sendCommand('SET_ZERO')">Set Zero Point</button>
-            <button class="btn-warning" onclick="sendCommand('RESET_ZERO')">Reset Zero</button>
             <button class="btn-danger" onclick="sendCommand('RESET_ANGLES')">Reset All Angles</button>
             <div style="margin-top: 15px; padding: 10px; background: white; border-radius: 5px;">
                 <div style="font-size: 14px; color: #666;">
@@ -1226,7 +1284,9 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <h3>Device Controls</h3>
             <button class="btn-primary" onclick="sendCommand('GET_DATA')">Get Sensor Data</button>
             <button class="btn-warning" onclick="sendCommand('RECALIBRATE')">Recalibrate</button>
+            <button class="btn-info" onclick="scanNetwork()">Scan Network</button>
             <button class="btn-info" onclick="showSettings()">Network Settings</button>
+            <button class="btn-info" onclick="sendCommand('SCAN_WIFI')">Scan WiFi</button>
         </div>
 
         <div id="devices-container" class="devices-grid">
@@ -1238,7 +1298,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <div style="background: #e9ecef; padding: 15px; border-radius: 5px;">
                 <p><strong>GET /api/status</strong> - Get device status</p>
                 <p><strong>POST /api/setZero</strong> - Set zero point</p>
-                <p><strong>POST /api/resetZero</strong> - Reset zero point</p>
                 <p><strong>GET /api/networkSettings</strong> - Get network settings</p>
                 <p><strong>POST /api/networkSettings</strong> - Update network settings</p>
             </div>
@@ -1258,6 +1317,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <div class="tab-buttons">
                 <button class="tab-btn active" onclick="showTab('ap-settings')">AP Settings</button>
                 <button class="tab-btn" onclick="showTab('sta-settings')">WiFi Client</button>
+                <button class="tab-btn" onclick="showTab('device-comment')">Device Comment</button>
             </div>
             
             <form id="settings-form">
@@ -1307,6 +1367,16 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                     </div>
                 </div>
                 
+                <div id="device-comment" class="tab-content">
+                    <div class="form-group">
+                        <label for="device-comment-text">Device Comment:</label>
+                        <textarea id="device-comment-text" name="device_comment" placeholder="Enter device description or comments..."></textarea>
+                    </div>
+                    <div style="font-size: 12px; color: #666;">
+                        This comment will be sent during device registration to the main gateway.
+                    </div>
+                </div>
+                
                 <div style="text-align: right; margin-top: 20px;">
                     <button type="button" onclick="hideSettings()">Cancel</button>
                     <button type="submit">Save Settings</button>
@@ -1321,6 +1391,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         let lastMessageDiv = document.getElementById('lastMessage');
         let cube = document.getElementById('cube');
         let zeroStatusSpan = document.getElementById('zeroStatus');
+        let apNameSpan = document.getElementById('ap-name');
         let devices = [];
         let currentSettings = {};
         
@@ -1423,18 +1494,9 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                     zeroStatusSpan.style.color = '#28a745';
                     showNotification('Zero point set successfully', 'success');
                 }
-                if (event.data === 'ZERO_POINT_RESET') {
-                    zeroStatusSpan.textContent = 'Not Set';
-                    zeroStatusSpan.style.color = '#dc3545';
-                    showNotification('Zero point reset', 'info');
-                }
                 if (event.data.startsWith('ZERO_SET:')) {
                     zeroStatusSpan.textContent = 'Set';
                     zeroStatusSpan.style.color = '#28a745';
-                }
-                if (event.data === 'ZERO_RESET') {
-                    zeroStatusSpan.textContent = 'Not Set';
-                    zeroStatusSpan.style.color = '#dc3545';
                 }
             };
             
@@ -1491,6 +1553,11 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 wifiStatus.style.color = '#dc3545';
             }
             
+            // Update AP name
+            if (currentSettings.ssid) {
+                apNameSpan.textContent = currentSettings.ssid;
+            }
+            
             // Update devices grid
             var container = document.getElementById('devices-container');
             
@@ -1516,6 +1583,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             
             card.innerHTML = '<div class="device-header">' +
                 '<div class="device-name">' + escapeHtml(device.hostname) + '</div>' +
+                '<span class="device-status ' + statusClass + '">' + statusText + '</span>' +
                 '</div>' +
                 '<div class="device-ip">' + escapeHtml(device.ip) + '</div>' +
                 '<div class="device-mac">' + escapeHtml(device.mac) + '</div>';
@@ -1585,7 +1653,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             document.getElementById('subnet').value = currentSettings.subnet || '50';
             document.getElementById('sta-ssid').value = currentSettings.sta_ssid || '';
             document.getElementById('sta-password').value = currentSettings.sta_password || '';
+            document.getElementById('device-comment-text').value = currentSettings.device_comment || '';
             document.getElementById('ap-mode-enabled').checked = currentSettings.ap_mode_enabled !== false;
+            
+            // Update AP name display
+            if (currentSettings.ssid) {
+                apNameSpan.textContent = currentSettings.ssid;
+            }
         }
         
         function showSettings() {
@@ -1664,6 +1738,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                 subnet: formData.get('subnet'),
                 sta_ssid: formData.get('sta_ssid'),
                 sta_password: formData.get('sta_password'),
+                device_comment: formData.get('device_comment'),
                 ap_mode_enabled: document.getElementById('ap-mode-enabled').checked
             };
             
@@ -1748,6 +1823,9 @@ void setup() {
     
     if (WiFi.status() == WL_CONNECTED) {
       Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+      
+      // Пытаемся зарегистрироваться на основном шлюзе
+      attemptRegistration();
     } else {
       Serial.println("\nFailed to connect to WiFi");
     }
@@ -1776,13 +1854,11 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/api/status", HTTP_GET, handleAPIStatus);
   server.on("/api/setZero", HTTP_POST, handleSetZero);
-  server.on("/api/resetZero", HTTP_POST, handleResetZero);
   server.on("/api/networkSettings", HTTP_GET, handleGetNetworkSettings);
   server.on("/api/networkSettings", HTTP_POST, handleNetworkSettings);
   
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
   server.on("/api/setZero", HTTP_OPTIONS, handleOptions);
-  server.on("/api/resetZero", HTTP_OPTIONS, handleOptions);
   server.on("/api/networkSettings", HTTP_OPTIONS, handleOptions);
   
   server.enableCORS(true);
