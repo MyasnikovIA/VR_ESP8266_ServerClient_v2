@@ -66,15 +66,14 @@ struct NetworkSettings {
   char device_comment[256];
 };
 
-// Sensor data
-float pitch = 0, roll = 0, yaw = 0;
-float lastSentPitch = 0, lastSentRoll = 0, lastSentYaw = 0;
+// Sensor data - БЕСКОНЕЧНЫЕ УГЛЫ
+float pitch = 0, roll = 0, yaw = 0; // Теперь бесконечные углы
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
 bool calibrated = false;
 unsigned long lastTime = 0;
 
 // Относительный ноль
-float zeroPitch = 0, zeroRoll = 0, zeroYaw = 0;
+float zeroPitchOffset = 0, zeroRollOffset = 0, zeroYawOffset = 0;
 bool zeroSet = false;
 
 // Накопленные углы (без ограничений)
@@ -86,7 +85,6 @@ bool firstMeasurement = true;
 bool clientConnected = false;
 unsigned long lastDataSend = 0;
 const unsigned long SEND_INTERVAL = 50;
-const float CHANGE_THRESHOLD = 1.0;
 
 // Массив для хранения подключенных устройств
 const int MAX_DEVICES = 10;
@@ -560,22 +558,61 @@ int getIPFromMAC(const String& mac) {
   return -1; // Нет свободных IP
 }
 
-// Установка относительного нуля
-void setZeroPoint() {
-  zeroPitch = accumulatedPitch;
-  zeroRoll = accumulatedRoll;
-  zeroYaw = accumulatedYaw;
+// Функция для обнуления всех углов
+void resetAllAngles() {
+  pitch = 0;
+  roll = 0;
+  yaw = 0;
+  accumulatedPitch = 0;
+  accumulatedRoll = 0;
+  accumulatedYaw = 0;
+  prevPitch = 0;
+  prevRoll = 0;
+  prevYaw = 0;
+  firstMeasurement = true;
+  
+  webSocket.broadcastTXT("All angles reset to zero");
+  Serial.println("All angles reset to zero");
+}
+
+// Функция для установки текущего положения как нулевой точки
+void setCurrentPositionAsZero() {
+  zeroPitchOffset = accumulatedPitch;
+  zeroRollOffset = accumulatedRoll;
+  zeroYawOffset = accumulatedYaw;
   zeroSet = true;
   
-  Serial.println("Zero point set");
-  Serial.print("Zero Pitch: "); Serial.print(zeroPitch);
-  Serial.print(" Roll: "); Serial.print(zeroRoll);
-  Serial.print(" Yaw: "); Serial.println(zeroYaw);
+  Serial.println("Current position set as zero point");
+  Serial.print("Zero Pitch Offset: "); Serial.print(zeroPitchOffset, 2);
+  Serial.print(" Roll Offset: "); Serial.print(zeroRollOffset, 2);
+  Serial.print(" Yaw Offset: "); Serial.println(zeroYawOffset, 2);
   
-  String message = "ZERO_SET:PITCH:" + String(zeroPitch, 2) + 
-                   ",ROLL:" + String(zeroRoll, 2) + 
-                   ",YAW:" + String(zeroYaw, 2);
+  String message = "ZERO_SET:PITCH:" + String(zeroPitchOffset, 2) + 
+                   ",ROLL:" + String(zeroRollOffset, 2) + 
+                   ",YAW:" + String(zeroYawOffset, 2);
   webSocket.broadcastTXT(message);
+}
+
+// Обнуление точек поворота
+void resetZeroOffsets() {
+  zeroPitchOffset = 0;
+  zeroRollOffset = 0;
+  zeroYawOffset = 0;
+  zeroSet = false;
+  
+  webSocket.broadcastTXT("Zero offsets reset to zero");
+  Serial.println("Zero offsets reset to zero");
+}
+
+// Сброс относительного нуля
+void resetZeroPoint() {
+  zeroPitchOffset = 0;
+  zeroRollOffset = 0;
+  zeroYawOffset = 0;
+  zeroSet = false;
+  
+  webSocket.broadcastTXT("Zero point reset");
+  Serial.println("Zero point reset");
 }
 
 // Расчет накопленных углов (без ограничений)
@@ -588,12 +625,12 @@ void updateAccumulatedAngles() {
     return;
   }
   
-  // Вычисляем разницу углов с учетом переходов через 180/-180
+  // Вычисляем разницу углов с учетом переходов через 180/-180 для ВСЕХ осей
   float deltaPitch = pitch - prevPitch;
   float deltaRoll = roll - prevRoll;
   float deltaYaw = yaw - prevYaw;
   
-  // Корректируем разницу для переходов через границу ±180
+  // Корректируем разницу для переходов через границу ±180 для ВСЕХ осей
   if (deltaPitch > 180) deltaPitch -= 360;
   else if (deltaPitch < -180) deltaPitch += 360;
   
@@ -603,7 +640,7 @@ void updateAccumulatedAngles() {
   if (deltaYaw > 180) deltaYaw -= 360;
   else if (deltaYaw < -180) deltaYaw += 360;
   
-  // Накопление углов
+  // Накопление углов для ВСЕХ осей
   accumulatedPitch += deltaPitch;
   accumulatedRoll += deltaRoll;
   accumulatedYaw += deltaYaw;
@@ -613,24 +650,24 @@ void updateAccumulatedAngles() {
   prevYaw = yaw;
 }
 
-// Получение относительных углов (бесконечные углы отклонения)
+// Получение относительных углов (относительно зафиксированного нуля)
 double getRelativePitch() {
   if (!zeroSet) return accumulatedPitch;
-  return accumulatedPitch - zeroPitch;
+  return accumulatedPitch - zeroPitchOffset;
 }
 
 double getRelativeRoll() {
   if (!zeroSet) return accumulatedRoll;
-  return accumulatedRoll - zeroRoll;
+  return accumulatedRoll - zeroRollOffset;
 }
 
 double getRelativeYaw() {
   if (!zeroSet) return accumulatedYaw;
-  return accumulatedYaw - zeroYaw;
+  return accumulatedYaw - zeroYawOffset;
 }
 
 void calibrateSensor() {
-  Serial.println("Calibrating...");
+  Serial.println("Calibrating MPU6050...");
   float sumX = 0, sumY = 0, sumZ = 0;
   
   for (int i = 0; i < 500; i++) {
@@ -648,6 +685,9 @@ void calibrateSensor() {
   calibrated = true;
   
   Serial.println("Calibration complete");
+  Serial.print("Gyro offsets - X: "); Serial.print(gyroOffsetX, 6);
+  Serial.print(" Y: "); Serial.print(gyroOffsetY, 6);
+  Serial.print(" Z: "); Serial.println(gyroOffsetZ, 6);
 }
 
 void sendSensorData() {
@@ -668,18 +708,12 @@ void sendSensorData() {
                 ",ACC_PITCH:" + String(accumulatedPitch, 2) +
                 ",ACC_ROLL:" + String(accumulatedRoll, 2) +
                 ",ACC_YAW:" + String(accumulatedYaw, 2) +
-                ",ZERO_SET:" + String(zeroSet ? "true" : "false");
+                ",ZERO_SET:" + String(zeroSet ? "true" : "false") +
+                ",ZERO_PITCH:" + String(zeroPitchOffset, 2) +
+                ",ZERO_ROLL:" + String(zeroRollOffset, 2) +
+                ",ZERO_YAW:" + String(zeroYawOffset, 2);
   
   webSocket.broadcastTXT(data);
-  lastSentPitch = pitch;
-  lastSentRoll = roll;
-  lastSentYaw = yaw;
-}
-
-bool dataChanged() {
-  return (abs(pitch - lastSentPitch) >= CHANGE_THRESHOLD ||
-          abs(roll - lastSentRoll) >= CHANGE_THRESHOLD ||
-          abs(yaw - lastSentYaw) >= CHANGE_THRESHOLD);
 }
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -709,30 +743,27 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         if (message == "GET_DATA") {
           sendSensorData();
         }
-        else if (message == "RECALIBRATE") {
+        else if (message == "RECALIBRATE" || message == "CAL") {
           calibrated = false;
           calibrateSensor();
           String calMessage = "RECALIBRATION_COMPLETE";
           webSocket.broadcastTXT(calMessage);
         }
-        else if (message == "RESET_ANGLES") {
-          pitch = 0; roll = 0; yaw = 0;
-          lastSentPitch = 0; lastSentRoll = 0; lastSentYaw = 0;
-          accumulatedPitch = 0;
-          accumulatedRoll = 0;
-          accumulatedYaw = 0;
-          prevPitch = 0;
-          prevRoll = 0;
-          prevYaw = 0;
-          firstMeasurement = true;
-          zeroSet = false;
-          String resetMessage = "ANGLES_RESET";
-          webSocket.broadcastTXT(resetMessage);
+        else if (message == "RESET_ANGLES" || message == "RA") {
+          resetAllAngles();
           sendSensorData();
         }
-        else if (message == "SET_ZERO") {
-          setZeroPoint();
+        else if (message == "SET_ZERO" || message == "SZ") {
+          setCurrentPositionAsZero();
           webSocket.broadcastTXT("ZERO_POINT_SET");
+        }
+        else if (message == "RESET_ZERO" || message == "RZ") {
+          resetZeroPoint();
+          webSocket.broadcastTXT("ZERO_POINT_RESET");
+        }
+        else if (message == "RESET_OFFSETS" || message == "RO") {
+          resetZeroOffsets();
+          webSocket.broadcastTXT("ZERO_OFFSETS_RESET");
         }
         else if (message == "SCAN_NETWORK") {
           scanNetwork();
@@ -741,6 +772,13 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           scanWiFiNetworks();
           String response = "{\"type\":\"wifi_networks\",\"networks\":" + wifiNetworks + "}";
           webSocket.sendTXT(num, response);
+        }
+        else if (message == "HELP" || message == "?") {
+          String help = "Available commands: ";
+          help += "GET_DATA, RECALIBRATE(CAL), RESET_ANGLES(RA), ";
+          help += "SET_ZERO(SZ), RESET_ZERO(RZ), RESET_OFFSETS(RO), ";
+          help += "SCAN_NETWORK, SCAN_WIFI, HELP(?)";
+          webSocket.sendTXT(num, help);
         }
         else {
           // Обработка JSON сообщений для сетевых функций
@@ -953,6 +991,10 @@ void handleOptions() {
 
 void handleAPIStatus() {
   addCORSHeaders();
+  
+  // Обновляем накопленные углы перед отправкой
+  updateAccumulatedAngles();
+  
   String json = "{";
   json += "\"status\":\"running\",";
   json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
@@ -967,6 +1009,9 @@ void handleAPIStatus() {
   json += "\"accRoll\":" + String(accumulatedRoll, 2) + ",";
   json += "\"accYaw\":" + String(accumulatedYaw, 2) + ",";
   json += "\"zeroSet\":" + String(zeroSet ? "true" : "false") + ",";
+  json += "\"zeroPitch\":" + String(zeroPitchOffset, 2) + ",";
+  json += "\"zeroRoll\":" + String(zeroRollOffset, 2) + ",";
+  json += "\"zeroYaw\":" + String(zeroYawOffset, 2) + ",";
   json += "\"apModeEnabled\":" + String(networkSettings.apModeEnabled ? "true" : "false");
   json += "}";
   server.send(200, "application/json", json);
@@ -974,8 +1019,15 @@ void handleAPIStatus() {
 
 void handleSetZero() {
   addCORSHeaders();
-  setZeroPoint();
+  setCurrentPositionAsZero();
   String response = "{\"status\":\"ok\",\"message\":\"Zero point set\"}";
+  server.send(200, "application/json", response);
+}
+
+void handleResetAngles() {
+  addCORSHeaders();
+  resetAllAngles();
+  String response = "{\"status\":\"ok\",\"message\":\"All angles reset\"}";
   server.send(200, "application/json", response);
 }
 
@@ -1255,13 +1307,17 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <h3>Angle Control</h3>
             <button class="btn-success" onclick="sendCommand('SET_ZERO')">Set Zero Point</button>
             <button class="btn-danger" onclick="sendCommand('RESET_ANGLES')">Reset All Angles</button>
+            <button class="btn-warning" onclick="sendCommand('RESET_ZERO')">Reset Zero Point</button>
+            <button class="btn-info" onclick="sendCommand('RESET_OFFSETS')">Reset Zero Offsets</button>
             <div style="margin-top: 15px; padding: 10px; background: white; border-radius: 5px;">
                 <div style="font-size: 14px; color: #666;">
                     <strong>Zero Point:</strong> <span id="zeroStatus" style="color: #dc3545; font-weight: bold;">Not Set</span>
                 </div>
                 <div style="font-size: 12px; color: #888; margin-top: 8px;">
-                    Zero point allows you to set a reference position. Relative angles show deviation from zero point.
-                    Accumulated angles show total rotation without limits (can exceed 360°).
+                    <strong>SET_ZERO</strong> - Set current position as reference<br>
+                    <strong>RESET_ANGLES</strong> - Reset all angles to zero<br>
+                    <strong>RESET_ZERO</strong> - Reset zero point offsets<br>
+                    <strong>RESET_OFFSETS</strong> - Clear zero point completely
                 </div>
             </div>
         </div>
@@ -1287,6 +1343,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <button class="btn-info" onclick="scanNetwork()">Scan Network</button>
             <button class="btn-info" onclick="showSettings()">Network Settings</button>
             <button class="btn-info" onclick="sendCommand('SCAN_WIFI')">Scan WiFi</button>
+            <button class="btn-info" onclick="sendCommand('HELP')">Help</button>
         </div>
 
         <div id="devices-container" class="devices-grid">
@@ -1298,6 +1355,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <div style="background: #e9ecef; padding: 15px; border-radius: 5px;">
                 <p><strong>GET /api/status</strong> - Get device status</p>
                 <p><strong>POST /api/setZero</strong> - Set zero point</p>
+                <p><strong>POST /api/resetAngles</strong> - Reset all angles</p>
                 <p><strong>GET /api/networkSettings</strong> - Get network settings</p>
                 <p><strong>POST /api/networkSettings</strong> - Update network settings</p>
             </div>
@@ -1441,6 +1499,9 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                     const accRollMatch = data.match(/ACC_ROLL:([-\d.]+)/);
                     const accYawMatch = data.match(/ACC_YAW:([-\d.]+)/);
                     const zeroSetMatch = data.match(/ZERO_SET:(true|false)/);
+                    const zeroPitchMatch = data.match(/ZERO_PITCH:([-\d.]+)/);
+                    const zeroRollMatch = data.match(/ZERO_ROLL:([-\d.]+)/);
+                    const zeroYawMatch = data.match(/ZERO_YAW:([-\d.]+)/);
                     
                     if (pitchMatch) {
                         const pitch = parseFloat(pitchMatch[1]);
@@ -1493,6 +1554,19 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
                     zeroStatusSpan.textContent = 'Set';
                     zeroStatusSpan.style.color = '#28a745';
                     showNotification('Zero point set successfully', 'success');
+                }
+                if (event.data === 'ZERO_POINT_RESET') {
+                    zeroStatusSpan.textContent = 'Not Set';
+                    zeroStatusSpan.style.color = '#dc3545';
+                    showNotification('Zero point reset', 'info');
+                }
+                if (event.data === 'ZERO_OFFSETS_RESET') {
+                    zeroStatusSpan.textContent = 'Not Set';
+                    zeroStatusSpan.style.color = '#dc3545';
+                    showNotification('Zero offsets reset', 'info');
+                }
+                if (event.data === 'All angles reset to zero') {
+                    showNotification('All angles reset to zero', 'info');
                 }
                 if (event.data.startsWith('ZERO_SET:')) {
                     zeroStatusSpan.textContent = 'Set';
@@ -1854,11 +1928,13 @@ void setup() {
   server.on("/", handleRoot);
   server.on("/api/status", HTTP_GET, handleAPIStatus);
   server.on("/api/setZero", HTTP_POST, handleSetZero);
+  server.on("/api/resetAngles", HTTP_POST, handleResetAngles);
   server.on("/api/networkSettings", HTTP_GET, handleGetNetworkSettings);
   server.on("/api/networkSettings", HTTP_POST, handleNetworkSettings);
   
   server.on("/api/status", HTTP_OPTIONS, handleOptions);
   server.on("/api/setZero", HTTP_OPTIONS, handleOptions);
+  server.on("/api/resetAngles", HTTP_OPTIONS, handleOptions);
   server.on("/api/networkSettings", HTTP_OPTIONS, handleOptions);
   
   server.enableCORS(true);
@@ -1888,6 +1964,7 @@ void loop() {
   
   if (!calibrated) return;
   
+  // Чтение данных с MPU6050
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
   
@@ -1900,22 +1977,19 @@ void loop() {
   float gyroY = g.gyro.y - gyroOffsetY;
   float gyroZ = g.gyro.z - gyroOffsetZ;
   
-  float accelPitch = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
-  float accelRoll = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
+  // ВСЕ оси обновляются ТОЛЬКО данными гироскопа для бесконечного суммирования
+  // УБРАНЫ ОГРАНИЧЕНИЯ УГЛОВ - теперь углы бесконечные
+  pitch += gyroX * deltaTime * 180.0 / PI;  // Только гироскоп для Pitch
+  roll += gyroY * deltaTime * 180.0 / PI;   // Только гироскоп для Roll
+  yaw += gyroZ * deltaTime * 180.0 / PI;    // Только гироскоп для Yaw
   
-  pitch += gyroX * deltaTime * 180.0 / PI;
-  roll += gyroY * deltaTime * 180.0 / PI;
-  yaw += gyroZ * deltaTime * 180.0 / PI;
+  // УБРАНЫ ОГРАНИЧЕНИЯ УГЛОВ - теперь углы могут быть любыми
+  // pitch, roll, yaw теперь бесконечные углы
   
-  float alpha = 0.96;
-  pitch = alpha * pitch + (1.0 - alpha) * accelPitch;
-  roll = alpha * roll + (1.0 - alpha) * accelRoll;
-  
+  // Отправка данных через WebSocket
   if (clientConnected && (currentTime - lastDataSend >= SEND_INTERVAL)) {
-    if (dataChanged() || lastDataSend == 0) {
-      sendSensorData();
-      lastDataSend = currentTime;
-    }
+    sendSensorData();
+    lastDataSend = currentTime;
   }
   
   // Периодическое сканирование сети
