@@ -1,16 +1,16 @@
+#include <Wire.h>
+#include <Adafruit_MPU6050.h>
+#include <Adafruit_Sensor.h>
 #include <ESP8266WiFi.h>
 #include <ESP8266WebServer.h>
 #include <WebSocketsServer.h>
 #include <EEPROM.h>
 #include <ArduinoJson.h>
-#include <Wire.h>
-#include <Adafruit_MPU6050.h>
-#include <Adafruit_Sensor.h>
 
 Adafruit_MPU6050 mpu;
 
 // Настройки WiFi по умолчанию
-const char* ap_ssid = "ESP8266_MPU6050";
+const char* ap_ssid = "VR_Head_Hom_001";
 const char* ap_password = "12345678";
 
 // Создание веб-сервера на порту 80
@@ -44,22 +44,12 @@ struct DHCPMessage {
     uint8_t options[312]; // Optional parameters
 };
 
-// Структура для фиксации IP адреса
-struct FixedIP {
-  char mac[18];
-  char ip[16];
-};
-
 // Структура для хранения информации об устройстве
 struct DeviceInfo {
   char ip[16];
   char mac[18];
-  char originalMac[18];  // Добавлено для отображения оригинального MAC
   char hostname[32];
-  char customName[32];
   int rssi;
-  bool ipFixed;
-  unsigned long lastUpdate;
   bool connected;
   unsigned long lastSeen;
 };
@@ -75,21 +65,7 @@ struct NetworkSettings {
   char sta_password[32];
 };
 
-// Структура для хранения пользовательских имен устройств
-struct DeviceAlias {
-  char mac[18];
-  char alias[32];
-};
-
-// Прототипы функций для DHCP
-void handleDHCPDiscover(DHCPMessage& discoverMsg);
-void handleDHCPRequest(DHCPMessage& requestMsg);
-void sendDHCPOffer(DHCPMessage& discoverMsg, int ipIndex);
-void sendDHCPAck(DHCPMessage& requestMsg, const String& clientMAC);
-String macToString(uint8_t* mac);
-int getIPFromMAC(const String& mac);
-
-// MPU6050 переменные
+// Sensor data
 float pitch = 0, roll = 0, yaw = 0;
 float lastSentPitch = 0, lastSentRoll = 0, lastSentYaw = 0;
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
@@ -97,7 +73,7 @@ bool calibrated = false;
 unsigned long lastTime = 0;
 
 // Относительный ноль
-float zeroPitchOffset = 0, zeroRollOffset = 0, zeroYawOffset = 0;
+float zeroPitch = 0, zeroRoll = 0, zeroYaw = 0;
 bool zeroSet = false;
 
 // Накопленные углы (без ограничений)
@@ -112,19 +88,9 @@ const unsigned long SEND_INTERVAL = 50;
 const float CHANGE_THRESHOLD = 1.0;
 
 // Массив для хранения подключенных устройств
-const int MAX_DEVICES = 5;
+const int MAX_DEVICES = 10;
 DeviceInfo devices[MAX_DEVICES];
 int deviceCount = 0;
-
-// Массив для хранения пользовательских имен
-const int MAX_ALIASES = 30;
-DeviceAlias deviceAliases[MAX_ALIASES];
-int aliasCount = 0;
-
-// Массив для фиксированных IP адресов
-const int MAX_FIXED_IPS = 20;
-FixedIP fixedIPs[MAX_FIXED_IPS];
-int fixedIPCount = 0;
 
 // Настройки сети
 NetworkSettings networkSettings;
@@ -132,7 +98,7 @@ NetworkSettings networkSettings;
 // DHCP пул адресов
 IPAddress dhcpStartIP;
 IPAddress dhcpEndIP;
-const int DHCP_POOL_SIZE = 50;
+const int DHCP_POOL_SIZE = 20;
 bool dhcpLeases[DHCP_POOL_SIZE];
 String dhcpMacTable[DHCP_POOL_SIZE];
 
@@ -145,724 +111,19 @@ unsigned long lastEEPROMSave = 0;
 const unsigned long EEPROM_SAVE_INTERVAL = 5000;
 bool eepromDirty = false;
 
-// Время последней проверки восстановления
-unsigned long lastRecoveryCheck = 0;
-const unsigned long RECOVERY_CHECK_INTERVAL = 30000;
-
-// Флаги сбоев
-bool wifiFailure = false;
-bool memoryFailure = false;
-unsigned long lastRestartAttempt = 0;
-const unsigned long RESTART_INTERVAL = 60000;
-
 // Переменные для сканирования WiFi
 String wifiNetworks = "";
 unsigned long lastWifiScan = 0;
 const unsigned long WIFI_SCAN_INTERVAL = 30000;
 bool scanningWifi = false;
 
-// HTML страница в PROGMEM с визуализацией MPU6050
-const char MAIN_page[] PROGMEM = R"rawliteral(
-<!DOCTYPE html>
-<html lang="en">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>VR MPU6050 Monitor</title>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 0; padding: 20px; background: #f5f5f5; }
-        .container { max-width: 1400px; margin: 0 auto; }
-        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
-        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .stat-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; }
-        .devices-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
-        .device-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
-        .device-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
-        .device-name { font-weight: bold; font-size: 1.1em; }
-        .device-ip { color: #666; font-family: monospace; }
-        .device-mac { color: #888; font-size: 0.9em; font-family: monospace; }
-        .device-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
-        .status-online { background: #d4edda; color: #155724; }
-        .status-offline { background: #f8d7da; color: #721c24; }
-        .fixed-ip-badge { background: #007bff; color: white; padding: 2px 6px; border-radius: 10px; font-size: 0.8em; margin-left: 8px; }
-        .controls { margin-bottom: 20px; }
-        .btn { background: #007bff; color: white; border: none; padding: 10px 15px; border-radius: 4px; cursor: pointer; margin-right: 10px; }
-        .btn:hover { background: #0056b3; }
-        .btn-success { background: #28a745; }
-        .btn-warning { background: #ffc107; color: black; }
-        .btn-danger { background: #dc3545; }
-        
-        /* Стили для визуализации MPU6050 */
-        .mpu-section { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
-        .visualization-container { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
-        .cube-container { perspective: 1000px; }
-        .cube { width: 200px; height: 200px; position: relative; transform-style: preserve-3d; margin: 0 auto; }
-        .cube-face { position: absolute; width: 200px; height: 200px; border: 2px solid #333; display: flex; align-items: center; justify-content: center; font-size: 20px; font-weight: bold; }
-        .front { background: rgba(255,0,0,0.7); transform: translateZ(100px); }
-        .back { background: rgba(0,255,0,0.7); transform: rotateY(180deg) translateZ(100px); }
-        .right { background: rgba(0,0,255,0.7); transform: rotateY(90deg) translateZ(100px); }
-        .left { background: rgba(255,255,0,0.7); transform: rotateY(-90deg) translateZ(100px); }
-        .top { background: rgba(255,0,255,0.7); transform: rotateX(90deg) translateZ(100px); }
-        .bottom { background: rgba(0,255,255,0.7); transform: rotateX(-90deg) translateZ(100px); }
-        
-        .data-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 15px; margin-top: 20px; }
-        .data-item { background: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 4px solid #28a745; }
-        .data-label { font-weight: bold; color: #495057; margin-bottom: 5px; }
-        .data-value { font-size: 18px; color: #2c3e50; }
-        
-        .gauge { width: 100%; height: 120px; position: relative; margin-top: 10px; }
-        .gauge-background { fill: none; stroke: #e9ecef; stroke-width: 10; }
-        .gauge-value { fill: none; stroke: #007bff; stroke-width: 10; stroke-linecap: round; transform: rotate(-90deg); transform-origin: 50% 50%; }
-        .gauge-center { fill: #fff; stroke: #333; stroke-width: 2; }
-        .gauge-text { font-size: 14px; font-weight: bold; text-anchor: middle; fill: #333; }
-        
-        .zero-controls { background: #e8f5e8; padding: 15px; border-radius: 8px; margin: 15px 0; border-left: 5px solid #28a745; }
-        
-        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
-        .modal-content { background: white; margin: 50px auto; padding: 20px; border-radius: 8px; max-width: 500px; }
-        .form-group { margin-bottom: 15px; }
-        label { display: block; margin-bottom: 5px; font-weight: bold; }
-        input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
-        .tab-buttons { display: flex; margin-bottom: 20px; }
-        .tab-btn { padding: 10px 20px; background: #e9ecef; border: none; cursor: pointer; margin-right: 5px; }
-        .tab-btn.active { background: #007bff; color: white; }
-        .tab-content { display: none; }
-        .tab-content.active { display: block; }
-        .wifi-status { padding: 10px; border-radius: 4px; margin-bottom: 15px; }
-        .wifi-connected { background: #d4edda; color: #155724; }
-        .wifi-disconnected { background: #f8d7da; color: #721c24; }
-        .wifi-scanning { background: #fff3cd; color: #856404; }
-        .network-list { max-height: 200px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
-        .network-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
-        .network-item:hover { background: #f8f9fa; }
-        .network-item:last-child { border-bottom: none; }
-        .network-ssid { font-weight: bold; }
-        .network-info { font-size: 0.8em; color: #666; }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <div class="header">
-            <h1>ESP8266_MPU6050</h1>
-            <p>Real-time 3D orientation visualization and network monitoring</p>
-        </div>
-        
-        <div class="stats">
-            <div class="stat-card">
-                <h3>Total Devices</h3>
-                <p id="total-devices">0</p>
-            </div>
-            <div class="stat-card">
-                <h3>Online Devices</h3>
-                <p id="online-devices">0</p>
-            </div>
-            <div class="stat-card">
-                <h3>ESP IP</h3>
-                <p id="esp-ip">0.0.0.0</p>
-            </div>
-            <div class="stat-card">
-                <h3>WiFi Status</h3>
-                <p id="wifi-status">-</p>
-            </div>
-            <div class="stat-card">
-                <h3>MPU6050 Status</h3>
-                <p id="mpu-status">-</p>
-            </div>
-        </div>
-        
-        <!-- Секция визуализации MPU6050 -->
-        <div class="mpu-section">
-            <h2>MPU6050 3D Orientation</h2>
-            
-            <div class="visualization-container">
-                <div class="cube-container">
-                    <h3>3D Cube Visualization</h3>
-                    <div class="cube" id="sensorCube">
-                        <div class="cube-face front">FRONT</div>
-                        <div class="cube-face back">BACK</div>
-                        <div class="cube-face right">RIGHT</div>
-                        <div class="cube-face left">LEFT</div>
-                        <div class="cube-face top">TOP</div>
-                        <div class="cube-face bottom">BOTTOM</div>
-                    </div>
-                </div>
-                
-                <div class="data-grid">
-                    <div class="data-item">
-                        <div class="data-label">Pitch (X-axis)</div>
-                        <div class="data-value" id="pitchValue">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Roll (Y-axis)</div>
-                        <div class="data-value" id="rollValue">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Yaw (Z-axis)</div>
-                        <div class="data-value" id="yawValue">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Relative Pitch</div>
-                        <div class="data-value" id="relPitch">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Relative Roll</div>
-                        <div class="data-value" id="relRoll">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Relative Yaw</div>
-                        <div class="data-value" id="relYaw">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Accumulated Pitch</div>
-                        <div class="data-value" id="accPitch">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Accumulated Roll</div>
-                        <div class="data-value" id="accRoll">0.00°</div>
-                    </div>
-                    <div class="data-item">
-                        <div class="data-label">Accumulated Yaw</div>
-                        <div class="data-value" id="accYaw">0.00°</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="zero-controls">
-                <h3>Angle Control</h3>
-                <button class="btn btn-danger" onclick="sendCommand('RESET_ANGLES')">Reset All Angles</button>
-                <button class="btn" onclick="sendCommand('RECALIBRATE')">Recalibrate Sensor</button>
-            </div>
-        </div>
-        
-        <div class="controls">
-            <button class="btn" onclick="scanNetwork()">Scan Network</button>
-            <button class="btn" onclick="showSettings()">Network Settings</button>
-            <button class="btn" onclick="showDeviceManagement()">Device Management</button>
-            <button class="btn btn-warning" onclick="scanWiFiNetworks()">Scan WiFi</button>
-            <button class="btn btn-success" onclick="connectToWiFi()">Connect WiFi</button>
-        </div>
-        
-        <div id="devices-container" class="devices-grid">
-            <div class="no-devices">No devices found. Click "Scan Network" to discover devices.</div>
-        </div>
-    </div>
-    
-    <!-- Network Settings Modal -->
-    <div id="settings-modal" class="modal">
-        <div class="modal-content">
-            <h2>Network Settings</h2>
-            
-            <div class="tab-buttons">
-                <button class="tab-btn active" onclick="showTab('ap-settings')">AP Settings</button>
-                <button class="tab-btn" onclick="showTab('sta-settings')">WiFi Client</button>
-            </div>
-            
-            <form id="settings-form">
-                <div id="ap-settings" class="tab-content active">
-                    <div class="form-group">
-                        <label>
-                            <input type="checkbox" id="ap-mode-enabled" name="ap_mode_enabled" checked>
-                            Enable Access Point Mode
-                        </label>
-                    </div>
-                    <div class="form-group">
-                        <label for="ssid">AP SSID:</label>
-                        <input type="text" id="ssid" name="ssid" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="password">AP Password:</label>
-                        <input type="password" id="password" name="password" required>
-                    </div>
-                    <div class="form-group">
-                        <label for="subnet">Subnet (1-254):</label>
-                        <input type="number" id="subnet" name="subnet" min="1" max="254" required>
-                    </div>
-                </div>
-                
-                <div id="sta-settings" class="tab-content">
-                    <div id="wifi-status-display" class="wifi-status wifi-disconnected">
-                        WiFi Status: Not Connected
-                    </div>
-                    <div class="form-group">
-                        <label for="sta-ssid">WiFi SSID:</label>
-                        <div style="display: flex;">
-                            <input type="text" id="sta-ssid" name="sta_ssid" style="flex: 1;">
-                            <button type="button" onclick="showNetworkList()" style="margin-left: 10px;">Select</button>
-                        </div>
-                    </div>
-                    <div class="form-group">
-                        <label for="sta-password">WiFi Password:</label>
-                        <input type="password" id="sta-password" name="sta_password">
-                    </div>
-                    <div class="form-group">
-                        <button type="button" onclick="scanWiFiNetworks()">Scan Networks</button>
-                    </div>
-                    <div id="network-list" class="network-list" style="display: none;">
-                        <div class="network-item">
-                            <div class="network-ssid">Scanning networks...</div>
-                        </div>
-                    </div>
-                </div>
-                
-                <div style="text-align: right; margin-top: 20px;">
-                    <button type="button" onclick="hideSettings()">Cancel</button>
-                    <button type="submit">Save Settings</button>
-                </div>
-            </form>
-        </div>
-    </div>
-    
-    <!-- Device Management Modal -->
-    <div id="device-management-modal" class="modal">
-        <div class="modal-content">
-            <h2>Device Management</h2>
-            
-            <div class="tab-buttons">
-                <button class="tab-btn active" onclick="showTab('aliases-tab')">Device Aliases</button>
-                <button class="tab-btn" onclick="showTab('fixed-ips-tab')">Fixed IPs</button>
-            </div>
-            
-            <div id="aliases-tab" class="tab-content active">
-                <h3>Device Aliases</h3>
-                <div id="aliases-list">
-                    <p>Aliases management functionality will be implemented here</p>
-                </div>
-                <button class="btn" onclick="showAddAliasForm()">Add Alias</button>
-            </div>
-            
-            <div id="fixed-ips-tab" class="tab-content">
-                <h3>Fixed IP Addresses</h3>
-                <div id="fixed-ips-list">
-                    <p>Fixed IPs management functionality will be implemented here</p>
-                </div>
-                <button class="btn" onclick="showAddFixedIPForm()">Add Fixed IP</button>
-            </div>
-            
-            <div style="text-align: right; margin-top: 20px;">
-                <button type="button" onclick="hideDeviceManagement()">Close</button>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Add Alias Modal -->
-    <div id="add-alias-modal" class="modal">
-        <div class="modal-content">
-            <h3>Add Device Alias</h3>
-            <form id="add-alias-form">
-                <div class="form-group">
-                    <label for="alias-mac">MAC Address:</label>
-                    <input type="text" id="alias-mac" name="mac" placeholder="AA:BB:CC:DD:EE:FF" required>
-                </div>
-                <div class="form-group">
-                    <label for="alias-name">Alias Name:</label>
-                    <input type="text" id="alias-name" name="alias" required>
-                </div>
-                <div style="text-align: right;">
-                    <button type="button" onclick="hideAddAliasForm()">Cancel</button>
-                    <button type="submit">Add Alias</button>
-                </div>
-            </form>
-        </div>
-    </div>
-    
-    <!-- Add Fixed IP Modal -->
-    <div id="add-fixed-ip-modal" class="modal">
-        <div class="modal-content">
-            <h3>Add Fixed IP</h3>
-            <form id="add-fixed-ip-form">
-                <div class="form-group">
-                    <label for="fixed-ip-mac">MAC Address:</label>
-                    <input type="text" id="fixed-ip-mac" name="mac" placeholder="AA:BB:CC:DD:EE:FF" required>
-                </div>
-                <div class="form-group">
-                    <label for="fixed-ip-address">IP Address:</label>
-                    <input type="text" id="fixed-ip-address" name="ip" placeholder="192.168.50.100" required>
-                </div>
-                <div style="text-align: right;">
-                    <button type="button" onclick="hideAddFixedIPForm()">Cancel</button>
-                    <button type="submit">Add Fixed IP</button>
-                </div>
-            </form>
-        </div>
-    </div>
-    
-    <script>
-        var ws;
-        var devices = [];
-        var currentSettings = {};
-        
-        function initWebSocket() {
-            var wsUrl = 'ws://' + window.location.hostname + ':81/';
-            console.log('Connecting to WebSocket:', wsUrl);
-            
-            ws = new WebSocket(wsUrl);
-            
-            ws.onopen = function() {
-                console.log('WebSocket connection established');
-                requestDevicesList();
-                loadCurrentSettings();
-                document.getElementById('mpu-status').textContent = 'Connected';
-                document.getElementById('mpu-status').style.color = '#28a745';
-            };
-            
-            ws.onmessage = function(event) {
-                console.log('WebSocket message received:', event.data);
-                try {
-                    var data = JSON.parse(event.data);
-                    handleWebSocketMessage(data);
-                } catch (e) {
-                    // Если не JSON, обрабатываем как данные MPU6050
-                    handleMPU6050Data(event.data);
-                }
-            };
-            
-            ws.onclose = function(event) {
-                console.log('WebSocket connection closed:', event.code, event.reason);
-                document.getElementById('mpu-status').textContent = 'Disconnected';
-                document.getElementById('mpu-status').style.color = '#dc3545';
-                setTimeout(initWebSocket, 2000);
-            };
-            
-            ws.onerror = function(error) {
-                console.error('WebSocket error:', error);
-            };
-        }
-        
-        function handleWebSocketMessage(data) {
-            switch(data.type) {
-                case 'devices_list':
-                    updateDevicesList(data);
-                    break;
-                case 'device_update':
-                    updateDevice(data.device);
-                    break;
-                case 'wifi_networks':
-                    updateWifiNetworks(data.networks);
-                    break;
-                case 'current_settings':
-                    currentSettings = data.settings;
-                    updateSettingsForm();
-                    break;
-            }
-        }
-        
-        function handleMPU6050Data(data) {
-            if (data.includes('PITCH:') && data.includes('ROLL:') && data.includes('YAW:')) {
-                // Parse MPU6050 data
-                const pitchMatch = data.match(/PITCH:([-\d.]+)/);
-                const rollMatch = data.match(/ROLL:([-\d.]+)/);
-                const yawMatch = data.match(/YAW:([-\d.]+)/);
-                const relPitchMatch = data.match(/REL_PITCH:([-\d.]+)/);
-                const relRollMatch = data.match(/REL_ROLL:([-\d.]+)/);
-                const relYawMatch = data.match(/REL_YAW:([-\d.]+)/);
-                const accPitchMatch = data.match(/ACC_PITCH:([-\d.]+)/);
-                const accRollMatch = data.match(/ACC_ROLL:([-\d.]+)/);
-                const accYawMatch = data.match(/ACC_YAW:([-\d.]+)/);
-                
-                let pitch = 0, roll = 0, yaw = 0;
-                
-                if (pitchMatch) {
-                    pitch = parseFloat(pitchMatch[1]);
-                    document.getElementById('pitchValue').textContent = pitch.toFixed(2) + '°';
-                }
-                if (rollMatch) {
-                    roll = parseFloat(rollMatch[1]);
-                    document.getElementById('rollValue').textContent = roll.toFixed(2) + '°';
-                }
-                if (yawMatch) {
-                    yaw = parseFloat(yawMatch[1]);
-                    document.getElementById('yawValue').textContent = yaw.toFixed(2) + '°';
-                }
-                if (relPitchMatch) {
-                    document.getElementById('relPitch').textContent = parseFloat(relPitchMatch[1]).toFixed(2) + '°';
-                }
-                if (relRollMatch) {
-                    document.getElementById('relRoll').textContent = parseFloat(relRollMatch[1]).toFixed(2) + '°';
-                }
-                if (relYawMatch) {
-                    document.getElementById('relYaw').textContent = parseFloat(relYawMatch[1]).toFixed(2) + '°';
-                }
-                if (accPitchMatch) {
-                    document.getElementById('accPitch').textContent = parseFloat(accPitchMatch[1]).toFixed(2) + '°';
-                }
-                if (accRollMatch) {
-                    document.getElementById('accRoll').textContent = parseFloat(accRollMatch[1]).toFixed(2) + '°';
-                }
-                if (accYawMatch) {
-                    document.getElementById('accYaw').textContent = parseFloat(accYawMatch[1]).toFixed(2) + '°';
-                }
-                
-                // Update cube rotation with all three angles
-                updateCubeRotation(pitch, roll, yaw);
-            }
-        }
-        
-        function updateCubeRotation(pitch, roll, yaw) {
-            const cube = document.getElementById('sensorCube');
-            // Apply 3D rotation based on sensor data
-            cube.style.transform = `rotateX(${pitch}deg) rotateY(${roll}deg) rotateZ(${yaw}deg)`;
-        }
-        
-        function sendCommand(command) {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(command);
-                console.log('Sent command:', command);
-            } else {
-                console.log('WebSocket not connected');
-            }
-        }
-        
-        function requestDevicesList() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'get_devices'}));
-            }
-        }
-        
-        function loadCurrentSettings() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'get_settings'}));
-            }
-        }
-        
-        function updateDevicesList(data) {
-            devices = data.devices || [];
-            
-            // Update statistics
-            document.getElementById('total-devices').textContent = data.totalDevices || 0;
-            document.getElementById('online-devices').textContent = data.onlineDevices || 0;
-            document.getElementById('esp-ip').textContent = data.espIp || '0.0.0.0';
-            
-            var wifiStatus = document.getElementById('wifi-status');
-            if (data.wifiStatus === 'connected') {
-                wifiStatus.textContent = 'Connected';
-                wifiStatus.style.color = '#28a745';
-            } else {
-                wifiStatus.textContent = 'Disconnected';
-                wifiStatus.style.color = '#dc3545';
-            }
-            
-            // Update devices grid
-            var container = document.getElementById('devices-container');
-            
-            if (devices.length === 0) {
-                container.innerHTML = '<div class="no-devices">No devices found. Click "Scan Network" to discover devices.</div>';
-                return;
-            }
-            
-            container.innerHTML = '';
-            
-            devices.forEach(function(device) {
-                var deviceCard = createDeviceCard(device);
-                container.appendChild(deviceCard);
-            });
-        }
-        
-        function createDeviceCard(device) {
-            var card = document.createElement('div');
-            card.className = 'device-card';
-            
-            var statusClass = device.connected ? 'status-online' : 'status-offline';
-            var statusText = device.connected ? 'Online' : 'Offline';
-            var fixedIPBadge = device.ipFixed ? '<span class="fixed-ip-badge">Fixed IP</span>' : '';
-            
-            card.innerHTML = '<div class="device-header">' +
-                '<div class="device-name">' + escapeHtml(device.displayName) + ' ' + fixedIPBadge + '</div>' +
-                '<span class="device-status ' + statusClass + '">' + statusText + '</span>' +
-                '</div>' +
-                '<div class="device-ip">' + escapeHtml(device.ip) + '</div>' +
-                '<div class="device-mac">' + escapeHtml(device.mac) + '</div>';
-            
-            return card;
-        }
-        
-        function scanNetwork() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'scan_network'}));
-            }
-        }
-        
-        function scanWiFiNetworks() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'scan_wifi'}));
-                document.getElementById('wifi-status-display').className = 'wifi-status wifi-scanning';
-                document.getElementById('wifi-status-display').textContent = 'Scanning WiFi networks...';
-            }
-        }
-        
-        function connectToWiFi() {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({type: 'connect_wifi'}));
-            }
-        }
-        
-        function updateWifiNetworks(networks) {
-            var networkList = document.getElementById('network-list');
-            networkList.innerHTML = '';
-            
-            if (networks && networks.length > 0) {
-                networks.forEach(function(network) {
-                    var networkItem = document.createElement('div');
-                    networkItem.className = 'network-item';
-                    networkItem.innerHTML = '<div class="network-ssid">' + escapeHtml(network.ssid) + '</div>' +
-                        '<div class="network-info">RSSI: ' + network.rssi + ' dBm, ' + network.encryption + '</div>';
-                    networkItem.onclick = function() {
-                        document.getElementById('sta-ssid').value = network.ssid;
-                        networkList.style.display = 'none';
-                    };
-                    networkList.appendChild(networkItem);
-                });
-                
-                document.getElementById('wifi-status-display').className = 'wifi-status wifi-disconnected';
-                document.getElementById('wifi-status-display').textContent = 'Found ' + networks.length + ' networks';
-            } else {
-                document.getElementById('wifi-status-display').className = 'wifi-status wifi-disconnected';
-                document.getElementById('wifi-status-display').textContent = 'No networks found';
-            }
-        }
-        
-        function updateSettingsForm() {
-            document.getElementById('ssid').value = currentSettings.ssid || '';
-            document.getElementById('password').value = currentSettings.password || '';
-            document.getElementById('subnet').value = currentSettings.subnet || '50';
-            document.getElementById('sta-ssid').value = currentSettings.sta_ssid || '';
-            document.getElementById('sta-password').value = currentSettings.sta_password || '';
-            document.getElementById('ap-mode-enabled').checked = currentSettings.ap_mode_enabled !== false;
-        }
-        
-        function showSettings() {
-            loadCurrentSettings();
-            document.getElementById('settings-modal').style.display = 'block';
-        }
-        
-        function hideSettings() {
-            document.getElementById('settings-modal').style.display = 'none';
-        }
-        
-        function showDeviceManagement() {
-            document.getElementById('device-management-modal').style.display = 'block';
-            updateAliasesList();
-            updateFixedIPsList();
-        }
-        
-        function hideDeviceManagement() {
-            document.getElementById('device-management-modal').style.display = 'none';
-        }
-        
-        function showTab(tabId) {
-            // Hide all tabs
-            var tabs = document.querySelectorAll('.tab-content');
-            tabs.forEach(function(tab) {
-                tab.classList.remove('active');
-            });
-            var buttons = document.querySelectorAll('.tab-btn');
-            buttons.forEach(function(btn) {
-                btn.classList.remove('active');
-            });
-            
-            // Show selected tab
-            document.getElementById(tabId).classList.add('active');
-            event.target.classList.add('active');
-        }
-        
-        function showNetworkList() {
-            var networkList = document.getElementById('network-list');
-            networkList.style.display = networkList.style.display === 'none' ? 'block' : 'none';
-        }
-        
-        function showAddAliasForm() {
-            document.getElementById('add-alias-modal').style.display = 'block';
-        }
-        
-        function hideAddAliasForm() {
-            document.getElementById('add-alias-modal').style.display = 'none';
-        }
-        
-        function showAddFixedIPForm() {
-            document.getElementById('add-fixed-ip-modal').style.display = 'block';
-        }
-        
-        function hideAddFixedIPForm() {
-            document.getElementById('add-fixed-ip-modal').style.display = 'none';
-        }
-        
-        function updateAliasesList() {
-            var list = document.getElementById('aliases-list');
-            list.innerHTML = '<p>Aliases management functionality will be implemented here</p>';
-        }
-        
-        function updateFixedIPsList() {
-            var list = document.getElementById('fixed-ips-list');
-            list.innerHTML = '<p>Fixed IPs management functionality will be implemented here</p>';
-        }
-        
-        function escapeHtml(unsafe) {
-            return unsafe
-                .replace(/&/g, "&amp;")
-                .replace(/</g, "&lt;")
-                .replace(/>/g, "&gt;")
-                .replace(/"/g, "&quot;")
-                .replace(/'/g, "&#039;");
-        }
-        
-        // Form submissions
-        document.getElementById('settings-form').addEventListener('submit', function(e) {
-            e.preventDefault();
-            var formData = new FormData(this);
-            var settings = {
-                ssid: formData.get('ssid'),
-                password: formData.get('password'),
-                subnet: formData.get('subnet'),
-                sta_ssid: formData.get('sta_ssid'),
-                sta_password: formData.get('sta_password'),
-                ap_mode_enabled: document.getElementById('ap-mode-enabled').checked
-            };
-            
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({
-                    type: 'update_network_settings',
-                    settings: settings
-                }));
-            }
-            
-            hideSettings();
-        });
-        
-        // Initialize WebSocket when page loads
-        window.onload = function() {
-            initWebSocket();
-        };
-        
-        // Close modals when clicking outside
-        window.onclick = function(event) {
-            var modals = document.getElementsByClassName('modal');
-            for (var i = 0; i < modals.length; i++) {
-                if (event.target == modals[i]) {
-                    modals[i].style.display = 'none';
-                }
-            }
-        };
-    </script>
-</body>
-</html>
-)rawliteral";
-
-// Вспомогательная функция для извлечения значения из строки с защитой от переполнения
-float extractValue(const String& message, const String& key) {
-  if (message.length() == 0 || key.length() == 0) return 0.0;
-  
-  int keyPos = message.indexOf(key);
-  if (keyPos == -1) return 0.0;
-  
-  int valueStart = keyPos + key.length();
-  if (valueStart >= message.length()) return 0.0;
-  
-  int valueEnd = message.indexOf(',', valueStart);
-  if (valueEnd == -1) valueEnd = message.length();
-  if (valueEnd > valueStart + 15) valueEnd = valueStart + 15; // Ограничение длины
-  
-  String valueStr = message.substring(valueStart, valueEnd);
-  return valueStr.toFloat();
-}
+// Прототипы функций для DHCP
+void handleDHCPDiscover(DHCPMessage& discoverMsg);
+void handleDHCPRequest(DHCPMessage& requestMsg);
+void sendDHCPOffer(DHCPMessage& discoverMsg, int ipIndex);
+void sendDHCPAck(DHCPMessage& requestMsg, const String& clientMAC);
+String macToString(uint8_t* mac);
+int getIPFromMAC(const String& mac);
 
 // Безопасное копирование строк с проверкой границ
 void safeStrcpy(char* dest, const char* src, size_t destSize) {
@@ -889,65 +150,9 @@ int findDeviceByMAC(const char* mac) {
   return -1;
 }
 
-// Функция для поиска устройства по IP
-int findDeviceByIP(const char* ip) {
-  if (ip == NULL) return -1;
-  
-  for (int i = 0; i < deviceCount; i++) {
-    if (strcmp(devices[i].ip, ip) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-// Функция для поиска алиаса по MAC
-int findAliasByMAC(const char* mac) {
-  if (mac == NULL) return -1;
-  
-  for (int i = 0; i < aliasCount; i++) {
-    if (strcmp(deviceAliases[i].mac, mac) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-// Функция для поиска фиксированного IP по MAC
-int findFixedIPByMAC(const char* mac) {
-  if (mac == NULL) return -1;
-  
-  for (int i = 0; i < fixedIPCount; i++) {
-    if (strcmp(fixedIPs[i].mac, mac) == 0) {
-      return i;
-    }
-  }
-  return -1;
-}
-
-// Функция для получения отображаемого имени устройства
-String getDisplayName(const char* mac, const char* originalHostname) {
-  if (mac == NULL) return "Unknown";
-  
-  // Сначала ищем пользовательское имя
-  int aliasIndex = findAliasByMAC(mac);
-  if (aliasIndex != -1) {
-    return String(deviceAliases[aliasIndex].alias);
-  }
-  
-  // Если пользовательского имени нет, используем оригинальное
-  return originalHostname && strlen(originalHostname) > 0 ? String(originalHostname) : "Unknown";
-}
-
-// Функция для добавления нового устройства с защитой от переполнения
+// Функция для добавления нового устройства
 bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi) {
   if (ip == NULL || mac == NULL) return false;
-  
-  // Проверяем длину входных данных
-  if (strlen(ip) >= 16 || strlen(mac) >= 18 || (hostname && strlen(hostname) >= 32)) {
-    Serial.println("Error: Input data too long for device structure");
-    return false;
-  }
   
   int index = findDeviceByMAC(mac);
   
@@ -955,7 +160,6 @@ bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi) 
     if (deviceCount < MAX_DEVICES) {
       safeStrcpy(devices[deviceCount].ip, ip, sizeof(devices[deviceCount].ip));
       safeStrcpy(devices[deviceCount].mac, mac, sizeof(devices[deviceCount].mac));
-      safeStrcpy(devices[deviceCount].originalMac, mac, sizeof(devices[deviceCount].originalMac));
       
       if (hostname && strlen(hostname) > 0) {
         safeStrcpy(devices[deviceCount].hostname, hostname, sizeof(devices[deviceCount].hostname));
@@ -963,20 +167,13 @@ bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi) 
         safeStrcpy(devices[deviceCount].hostname, "Unknown", sizeof(devices[deviceCount].hostname));
       }
       
-      safeStrcpy(devices[deviceCount].customName, "", sizeof(devices[deviceCount].customName));
       devices[deviceCount].rssi = rssi;
-      
-      // Проверяем есть ли фиксированный IP для этого MAC
-      int fixedIndex = findFixedIPByMAC(mac);
-      devices[deviceCount].ipFixed = (fixedIndex != -1);
-      
-      devices[deviceCount].lastUpdate = 0;
       devices[deviceCount].connected = true;
       devices[deviceCount].lastSeen = millis();
       deviceCount++;
       
-      Serial.printf("New device: %s (%s) - %s - RSSI: %d - IP Fixed: %s\n", 
-                   hostname ? hostname : "Unknown", ip, mac, rssi, devices[deviceCount-1].ipFixed ? "YES" : "NO");
+      Serial.printf("New device: %s (%s) - %s - RSSI: %d\n", 
+                   hostname ? hostname : "Unknown", ip, mac, rssi);
       return true;
     } else {
       Serial.println("Device limit reached!");
@@ -994,112 +191,29 @@ bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi) 
   }
 }
 
-// Функция для отправки обновления устройства веб-клиентам
-void sendDeviceUpdateToWebClients(DeviceInfo* device) {
-  DynamicJsonDocument doc(512);
-  if (doc.capacity() == 0) {
-    Serial.println("Error: Failed to allocate JSON document for device update");
-    return;
-  }
-  
-  doc["type"] = "device_update";
-  JsonObject deviceObj = doc.createNestedObject("device");
-  deviceObj["ip"] = device->ip;
-  deviceObj["mac"] = device->mac;
-  deviceObj["originalMac"] = device->originalMac;
-  deviceObj["hostname"] = device->hostname;
-  deviceObj["displayName"] = getDisplayName(device->mac, device->hostname);
-  deviceObj["connected"] = device->connected;
-  deviceObj["ipFixed"] = device->ipFixed;
-  deviceObj["rssi"] = device->rssi;
-  
-  String json;
-  if (serializeJson(doc, json) == 0) {
-    Serial.println("Error: Failed to serialize JSON for device update");
-  } else {
-    webSocket.broadcastTXT(json);
-  }
-}
-
 // Функция для отправки полного списка устройств веб-клиентам
 void sendDevicesListToWebClients() {
   DynamicJsonDocument doc(4096);
   
   JsonArray devicesArray = doc.createNestedArray("devices");
   
-  // Временный массив для объединения устройств по IP
-  struct MergedDevice {
-    String ip;
-    bool processed;
-    int deviceIndex;
-  };
-  
-  MergedDevice mergedDevices[MAX_DEVICES];
-  int mergedCount = 0;
-  
-  // Сначала собираем все уникальные IP
-  for (int i = 0; i < deviceCount; i++) {
-    bool ipExists = false;
-    for (int j = 0; j < mergedCount; j++) {
-      if (mergedDevices[j].ip == devices[i].ip) {
-        ipExists = true;
-        break;
-      }
-    }
-    
-    if (!ipExists) {
-      mergedDevices[mergedCount].ip = devices[i].ip;
-      mergedDevices[mergedCount].processed = false;
-      mergedDevices[mergedCount].deviceIndex = i;
-      mergedCount++;
-    }
-  }
-  
   // Подсчитываем статистику
   int onlineCount = 0;
-  int fixedCount = 0;
   
   for (int i = 0; i < deviceCount; i++) {
     if (devices[i].connected) onlineCount++;
-    if (devices[i].ipFixed) fixedCount++;
-  }
-  
-  // Обрабатываем каждый уникальный IP
-  for (int i = 0; i < mergedCount; i++) {
-    if (mergedDevices[i].processed) continue;
     
-    String currentIP = mergedDevices[i].ip;
-    
-    // Ищем все устройства с этим IP
-    DeviceInfo* normalDevice = nullptr;
-    
-    for (int j = 0; j < deviceCount; j++) {
-      if (String(devices[j].ip) == currentIP) {
-        normalDevice = &devices[j];
-        mergedDevices[i].processed = true;
-      }
-    }
-    
-    // Создаем объединенное устройство
     JsonObject deviceObj = devicesArray.createNestedObject();
-    
-    if (normalDevice != nullptr) {
-      // Используем данные обычного устройства
-      deviceObj["ip"] = normalDevice->ip;
-      deviceObj["mac"] = normalDevice->mac;
-      deviceObj["originalMac"] = normalDevice->originalMac;
-      deviceObj["hostname"] = normalDevice->hostname;
-      deviceObj["displayName"] = getDisplayName(normalDevice->mac, normalDevice->hostname);
-      deviceObj["rssi"] = normalDevice->rssi;
-      deviceObj["ipFixed"] = normalDevice->ipFixed;
-      deviceObj["connected"] = normalDevice->connected;
-    }
+    deviceObj["ip"] = devices[i].ip;
+    deviceObj["mac"] = devices[i].mac;
+    deviceObj["hostname"] = devices[i].hostname;
+    deviceObj["rssi"] = devices[i].rssi;
+    deviceObj["connected"] = devices[i].connected;
   }
   
   doc["type"] = "devices_list";
   doc["totalDevices"] = deviceCount;
   doc["onlineDevices"] = onlineCount;
-  doc["fixedIPs"] = fixedCount;
   doc["espIp"] = WiFi.softAPIP().toString();
   doc["wifiStatus"] = WiFi.status() == WL_CONNECTED ? "connected" : "disconnected";
   doc["apModeEnabled"] = networkSettings.apModeEnabled;
@@ -1135,10 +249,7 @@ void scanNetwork() {
     
     // Добавляем устройство только если это не дубликат (по MAC-адресу)
     if (findDeviceByMAC(mac) == -1) {
-      // Используем фиксированное значение RSSI, так как структура не содержит эту информацию
       addDevice(ip, mac, "WiFi Client", -50);
-    } else {
-      Serial.printf("Skipping duplicate device: %s (%s)\n", mac, ip);
     }
     
     station = STAILQ_NEXT(station, next);
@@ -1196,7 +307,7 @@ void initDHCPServer() {
   }
   
   dhcpStartIP = IPAddress(192, 168, subnet, 2);
-  dhcpEndIP = IPAddress(192, 168, subnet, 50);
+  dhcpEndIP = IPAddress(192, 168, subnet, 20);
   
   // Инициализация пула адресов
   for (int i = 0; i < DHCP_POOL_SIZE; i++) {
@@ -1309,7 +420,7 @@ void sendDHCPOffer(DHCPMessage& discoverMsg, int ipIndex) {
   offerMsg.siaddr = WiFi.softAPIP().v4();
   
   memcpy(offerMsg.chaddr, discoverMsg.chaddr, 16);
-  strcpy((char*)offerMsg.sname, "ESP8266_DHCP");
+  strcpy((char*)offerMsg.sname, "VR_Head_DHCP");
   
   // Добавляем опции
   int optIndex = 0;
@@ -1376,7 +487,7 @@ void sendDHCPAck(DHCPMessage& requestMsg, const String& clientMAC) {
   ackMsg.siaddr = WiFi.softAPIP().v4();
   
   memcpy(ackMsg.chaddr, requestMsg.chaddr, 16);
-  strcpy((char*)ackMsg.sname, "ESP8266_DHCP");
+  strcpy((char*)ackMsg.sname, "VR_Head_DHCP");
   
   // Добавляем опции
   int optIndex = 0;
@@ -1444,9 +555,103 @@ int getIPFromMAC(const String& mac) {
   return -1; // Нет свободных IP
 }
 
-// Функция для калибровки MPU6050
+// Установка относительного нуля
+void setZeroPoint() {
+  zeroPitch = pitch;
+  zeroRoll = roll;
+  zeroYaw = yaw;
+  zeroSet = true;
+  
+  // Сбрасываем накопленные углы при установке нуля
+  accumulatedPitch = 0;
+  accumulatedRoll = 0;
+  accumulatedYaw = 0;
+  prevPitch = pitch;
+  prevRoll = roll;
+  prevYaw = yaw;
+  
+  Serial.println("Zero point set");
+  Serial.print("Zero Pitch: "); Serial.print(zeroPitch);
+  Serial.print(" Roll: "); Serial.print(zeroRoll);
+  Serial.print(" Yaw: "); Serial.println(zeroYaw);
+  
+  String message = "ZERO_SET:PITCH:" + String(zeroPitch, 2) + 
+                   ",ROLL:" + String(zeroRoll, 2) + 
+                   ",YAW:" + String(zeroYaw, 2);
+  webSocket.broadcastTXT(message);
+}
+
+// Сброс относительного нуля
+void resetZeroPoint() {
+  zeroPitch = 0;
+  zeroRoll = 0;
+  zeroYaw = 0;
+  zeroSet = false;
+  
+  accumulatedPitch = 0;
+  accumulatedRoll = 0;
+  accumulatedYaw = 0;
+  prevPitch = pitch;
+  prevRoll = roll;
+  prevYaw = yaw;
+  
+  Serial.println("Zero point reset");
+  webSocket.broadcastTXT("ZERO_RESET");
+}
+
+// Расчет накопленных углов (без ограничений)
+void updateAccumulatedAngles() {
+  if (firstMeasurement) {
+    prevPitch = pitch;
+    prevRoll = roll;
+    prevYaw = yaw;
+    firstMeasurement = false;
+    return;
+  }
+  
+  // Вычисляем разницу углов с учетом переходов через 180/-180
+  float deltaPitch = pitch - prevPitch;
+  float deltaRoll = roll - prevRoll;
+  float deltaYaw = yaw - prevYaw;
+  
+  // Корректируем разницу для переходов через границу ±180
+  if (deltaPitch > 180) deltaPitch -= 360;
+  else if (deltaPitch < -180) deltaPitch += 360;
+  
+  if (deltaRoll > 180) deltaRoll -= 360;
+  else if (deltaRoll < -180) deltaRoll += 360;
+  
+  if (deltaYaw > 180) deltaYaw -= 360;
+  else if (deltaYaw < -180) deltaYaw += 360;
+  
+  // Накопление углов
+  accumulatedPitch += deltaPitch;
+  accumulatedRoll += deltaRoll;
+  accumulatedYaw += deltaYaw;
+  
+  prevPitch = pitch;
+  prevRoll = roll;
+  prevYaw = yaw;
+}
+
+// Получение относительных углов (без ограничений)
+double getRelativePitch() {
+  if (!zeroSet) return accumulatedPitch;
+  return accumulatedPitch - zeroPitch;
+}
+
+double getRelativeRoll() {
+  if (!zeroSet) return accumulatedRoll;
+  return accumulatedRoll - zeroRoll;
+}
+
+double getRelativeYaw() {
+  if (!zeroSet) return accumulatedYaw;
+  return accumulatedYaw - zeroYaw;
+}
+
 void calibrateSensor() {
-  Serial.println("Calibrating MPU6050...");
+  Serial.println("Calibrating...");
   float sumX = 0, sumY = 0, sumZ = 0;
   
   for (int i = 0; i < 500; i++) {
@@ -1464,67 +669,9 @@ void calibrateSensor() {
   calibrated = true;
   
   Serial.println("Calibration complete");
-  Serial.print("Gyro offsets - X: "); Serial.print(gyroOffsetX, 6);
-  Serial.print(" Y: "); Serial.print(gyroOffsetY, 6);
-  Serial.print(" Z: "); Serial.println(gyroOffsetZ, 6);
 }
 
-// Обновление накопленных углов
-void updateAccumulatedAngles() {
-  if (firstMeasurement) {
-    prevPitch = pitch;
-    prevRoll = roll;
-    prevYaw = yaw;
-    firstMeasurement = false;
-    return;
-  }
-  
-  // Вычисляем разницу углов с учетом переходов через 180/-180 для ВСЕХ осей
-  float deltaPitch = pitch - prevPitch;
-  float deltaRoll = roll - prevRoll;
-  float deltaYaw = yaw - prevYaw;
-  
-  // Корректируем разницу для переходов через границу ±180 для ВСЕХ осей
-  if (deltaPitch > 180) deltaPitch -= 360;
-  else if (deltaPitch < -180) deltaPitch += 360;
-  
-  if (deltaRoll > 180) deltaRoll -= 360;
-  else if (deltaRoll < -180) deltaRoll += 360;
-  
-  if (deltaYaw > 180) deltaYaw -= 360;
-  else if (deltaYaw < -180) deltaYaw += 360;
-  
-  // Накопление углов для ВСЕХ осей
-  accumulatedPitch += deltaPitch;
-  accumulatedRoll += deltaRoll;
-  accumulatedYaw += deltaYaw;
-  
-  prevPitch = pitch;
-  prevRoll = roll;
-  prevYaw = yaw;
-}
-
-// Получение относительных углов
-double getRelativePitch() {
-  if (!zeroSet) return accumulatedPitch;
-  double relative = accumulatedPitch - zeroPitchOffset;
-  return relative;
-}
-
-double getRelativeRoll() {
-  if (!zeroSet) return accumulatedRoll;
-  double relative = accumulatedRoll - zeroRollOffset;
-  return relative;
-}
-
-double getRelativeYaw() {
-  if (!zeroSet) return accumulatedYaw;
-  double relative = accumulatedYaw - zeroYawOffset;
-  return relative;
-}
-
-// Отправка данных MPU6050 через WebSocket
-void sendMPU6050Data() {
+void sendSensorData() {
   // Обновляем накопленные углы
   updateAccumulatedAngles();
   
@@ -1533,57 +680,29 @@ void sendMPU6050Data() {
   double relRoll = getRelativeRoll();
   double relYaw = getRelativeYaw();
   
-  // Формируем данные для отправки с именем точки доступа
-  String data = "DEVICE:" + String(ap_ssid);
-  data += ",PITCH:" + String(pitch, 2);
-  data += ",ROLL:" + String(roll, 2);
-  data += ",YAW:" + String(yaw, 2);
-  data += ",REL_PITCH:" + String(relPitch, 2);
-  data += ",REL_ROLL:" + String(relRoll, 2);
-  data += ",REL_YAW:" + String(relYaw, 2);
-  data += ",ACC_PITCH:" + String(accumulatedPitch, 2);
-  data += ",ACC_ROLL:" + String(accumulatedRoll, 2);
-  data += ",ACC_YAW:" + String(accumulatedYaw, 2);
+  String data = "PITCH:" + String(pitch, 1) + 
+                ",ROLL:" + String(roll, 1) + 
+                ",YAW:" + String(yaw, 1) +
+                ",REL_PITCH:" + String(relPitch, 2) +
+                ",REL_ROLL:" + String(relRoll, 2) +
+                ",REL_YAW:" + String(relYaw, 2) +
+                ",ACC_PITCH:" + String(accumulatedPitch, 2) +
+                ",ACC_ROLL:" + String(accumulatedRoll, 2) +
+                ",ACC_YAW:" + String(accumulatedYaw, 2) +
+                ",ZERO_SET:" + String(zeroSet ? "true" : "false");
   
   webSocket.broadcastTXT(data);
-  
-  // Отладочный вывод в Serial
-  static unsigned long lastDebugPrint = 0;
-  if (millis() - lastDebugPrint > 1000) {
-    Serial.println("=== MPU6050 DATA ===");
-    Serial.printf("Pitch: %.2f° | Roll: %.2f° | Yaw: %.2f°\n", pitch, roll, yaw);
-    Serial.printf("Relative - Pitch: %.2f° | Roll: %.2f° | Yaw: %.2f°\n", relPitch, relRoll, relYaw);
-    Serial.printf("Accumulated - Pitch: %.2f° | Roll: %.2f° | Yaw: %.2f°\n", accumulatedPitch, accumulatedRoll, accumulatedYaw);
-    Serial.println("===================");
-    lastDebugPrint = millis();
-  }
+  lastSentPitch = pitch;
+  lastSentRoll = roll;
+  lastSentYaw = yaw;
 }
 
-// Сброс всех углов
-void resetAllAngles() {
-  pitch = 0;
-  roll = 0;
-  yaw = 0;
-  accumulatedPitch = 0;
-  accumulatedRoll = 0;
-  accumulatedYaw = 0;
-  prevPitch = 0;
-  prevRoll = 0;
-  prevYaw = 0;
-  firstMeasurement = true;
-  
-  Serial.println("All angles reset to zero");
-  webSocket.broadcastTXT("ANGLES_RESET");
-}
-
-// Проверка изменения данных
 bool dataChanged() {
   return (abs(pitch - lastSentPitch) >= CHANGE_THRESHOLD ||
           abs(roll - lastSentRoll) >= CHANGE_THRESHOLD ||
           abs(yaw - lastSentYaw) >= CHANGE_THRESHOLD);
 }
 
-// Обработчик WebSocket событий для MPU6050
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
   switch(type) {
     case WStype_DISCONNECTED:
@@ -1596,13 +715,10 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         IPAddress ip = webSocket.remoteIP(num);
         Serial.printf("[%u] Connected from %d.%d.%d.%d\n", num, ip[0], ip[1], ip[2], ip[3]);
         clientConnected = true;
+        sendSensorData();
         
-        // Отправляем приветственное сообщение с именем точки доступа
-        String welcomeMsg = "DEVICE_CONNECTED:" + String(ap_ssid);
-        webSocket.sendTXT(num, welcomeMsg);
-        
-        // Отправляем текущие данные
-        sendMPU6050Data();
+        // Отправляем список устройств при подключении
+        sendDevicesListToWebClients();
       }
       break;
       
@@ -1611,19 +727,38 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
         String message = String((char*)payload);
         Serial.printf("[%u] Received: %s\n", num, message);
         
-        // Обработка команд MPU6050
         if (message == "GET_DATA") {
-          sendMPU6050Data();
+          sendSensorData();
         }
         else if (message == "RECALIBRATE") {
           calibrated = false;
           calibrateSensor();
-          webSocket.broadcastTXT("RECALIBRATION_COMPLETE");
+          String calMessage = "RECALIBRATION_COMPLETE";
+          webSocket.broadcastTXT(calMessage);
         }
-        else if (message == "RESET_ANGLES" || message == "RA") {
-          resetAllAngles();
-          webSocket.broadcastTXT("ANGLES_RESET");
-          sendMPU6050Data();
+        else if (message == "RESET_ANGLES") {
+          pitch = 0; roll = 0; yaw = 0;
+          lastSentPitch = 0; lastSentRoll = 0; lastSentYaw = 0;
+          resetZeroPoint();
+          String resetMessage = "ANGLES_RESET";
+          webSocket.broadcastTXT(resetMessage);
+          sendSensorData();
+        }
+        else if (message == "SET_ZERO") {
+          setZeroPoint();
+          webSocket.broadcastTXT("ZERO_POINT_SET");
+        }
+        else if (message == "RESET_ZERO") {
+          resetZeroPoint();
+          webSocket.broadcastTXT("ZERO_POINT_RESET");
+        }
+        else if (message == "SCAN_NETWORK") {
+          scanNetwork();
+        }
+        else if (message == "SCAN_WIFI") {
+          scanWiFiNetworks();
+          String response = "{\"type\":\"wifi_networks\",\"networks\":" + wifiNetworks + "}";
+          webSocket.sendTXT(num, response);
         }
         else {
           // Обработка JSON сообщений для сетевых функций
@@ -1633,14 +768,8 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
           if (!error) {
             String messageType = doc["type"];
             
-            if (messageType == "scan_network") {
-              scanNetwork();
-            } else if (messageType == "get_devices") {
+            if (messageType == "get_devices") {
               sendDevicesListToWebClients();
-            } else if (messageType == "scan_wifi") {
-              scanWiFiNetworks();
-              String response = "{\"type\":\"wifi_networks\",\"networks\":" + wifiNetworks + "}";
-              webSocket.sendTXT(num, response);
             } else if (messageType == "get_settings") {
               DynamicJsonDocument settingsDoc(512);
               settingsDoc["type"] = "current_settings";
@@ -1655,6 +784,33 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
               String json;
               serializeJson(settingsDoc, json);
               webSocket.sendTXT(num, json);
+            } else if (messageType == "update_network_settings") {
+              JsonObject settings = doc["settings"];
+              
+              if (settings.containsKey("ssid")) {
+                safeStrcpy(networkSettings.ssid, settings["ssid"], sizeof(networkSettings.ssid));
+              }
+              if (settings.containsKey("password")) {
+                safeStrcpy(networkSettings.password, settings["password"], sizeof(networkSettings.password));
+              }
+              if (settings.containsKey("subnet")) {
+                safeStrcpy(networkSettings.subnet, settings["subnet"], sizeof(networkSettings.subnet));
+              }
+              if (settings.containsKey("sta_ssid")) {
+                safeStrcpy(networkSettings.sta_ssid, settings["sta_ssid"], sizeof(networkSettings.sta_ssid));
+              }
+              if (settings.containsKey("sta_password")) {
+                safeStrcpy(networkSettings.sta_password, settings["sta_password"], sizeof(networkSettings.sta_password));
+              }
+              if (settings.containsKey("ap_mode_enabled")) {
+                networkSettings.apModeEnabled = settings["ap_mode_enabled"];
+              }
+              
+              networkSettings.configured = true;
+              saveNetworkSettingsToEEPROM();
+              eepromDirty = true;
+              
+              webSocket.sendTXT(num, "{\"type\":\"settings_updated\",\"status\":\"success\"}");
             }
           }
         }
@@ -1715,7 +871,6 @@ void saveNetworkSettingsToEEPROM() {
     Serial.println("Network settings saved to EEPROM");
   } else {
     Serial.println("Error saving network settings to EEPROM");
-    memoryFailure = true;
   }
   EEPROM.end();
 }
@@ -1781,13 +936,56 @@ void loadNetworkSettingsFromEEPROM() {
   EEPROM.end();
 }
 
-// Обработчик для главной страницы
-void handleRoot() {
-  server.send_P(200, "text/html", MAIN_page);
+void addCORSHeaders() {
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.sendHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
+  server.sendHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  server.sendHeader("Content-Type", "text/html; charset=utf-8");
 }
 
-// Обработчик для обновления настроек сети
-void handleUpdateNetworkSettings() {
+void handleOptions() {
+  addCORSHeaders();
+  server.send(200, "text/plain", "");
+}
+
+void handleAPIStatus() {
+  addCORSHeaders();
+  String json = "{";
+  json += "\"status\":\"running\",";
+  json += "\"ip\":\"" + WiFi.localIP().toString() + "\",";
+  json += "\"ap_ip\":\"" + WiFi.softAPIP().toString() + "\",";
+  json += "\"pitch\":" + String(pitch, 2) + ",";
+  json += "\"roll\":" + String(roll, 2) + ",";
+  json += "\"yaw\":" + String(yaw, 2) + ",";
+  json += "\"relPitch\":" + String(getRelativePitch(), 2) + ",";
+  json += "\"relRoll\":" + String(getRelativeRoll(), 2) + ",";
+  json += "\"relYaw\":" + String(getRelativeYaw(), 2) + ",";
+  json += "\"accPitch\":" + String(accumulatedPitch, 2) + ",";
+  json += "\"accRoll\":" + String(accumulatedRoll, 2) + ",";
+  json += "\"accYaw\":" + String(accumulatedYaw, 2) + ",";
+  json += "\"zeroSet\":" + String(zeroSet ? "true" : "false") + ",";
+  json += "\"apModeEnabled\":" + String(networkSettings.apModeEnabled ? "true" : "false");
+  json += "}";
+  server.send(200, "application/json", json);
+}
+
+void handleSetZero() {
+  addCORSHeaders();
+  setZeroPoint();
+  String response = "{\"status\":\"ok\",\"message\":\"Zero point set\"}";
+  server.send(200, "application/json", response);
+}
+
+void handleResetZero() {
+  addCORSHeaders();
+  resetZeroPoint();
+  String response = "{\"status\":\"ok\",\"message\":\"Zero point reset\"}";
+  server.send(200, "application/json", response);
+}
+
+void handleNetworkSettings() {
+  addCORSHeaders();
+  
   if (server.hasArg("plain")) {
     String body = server.arg("plain");
     DynamicJsonDocument doc(512);
@@ -1818,31 +1016,6 @@ void handleUpdateNetworkSettings() {
       networkSettings.configured = true;
       saveNetworkSettingsToEEPROM();
       
-      // Перезапускаем точку доступа с новыми настройками
-      int subnet = atoi(networkSettings.subnet);
-      if (subnet < 1 || subnet > 254) {
-        subnet = 50;
-      }
-      
-      WiFi.softAPdisconnect(true);
-      delay(1000);
-      
-      if (networkSettings.apModeEnabled) {
-        IPAddress local_ip(192, 168, subnet, 1);
-        IPAddress gateway(192, 168, subnet, 1);
-        IPAddress subnet_mask(255, 255, 255, 0);
-        
-        WiFi.softAPConfig(local_ip, gateway, subnet_mask);
-        
-        if (WiFi.softAP(networkSettings.ssid, networkSettings.password)) {
-          Serial.println("WiFi AP restarted with new settings");
-          wifiFailure = false;
-        } else {
-          Serial.println("Failed to restart WiFi AP with new settings");
-          wifiFailure = true;
-        }
-      }
-      
       server.send(200, "application/json", "{\"status\":\"success\"}");
     } else {
       server.send(400, "application/json", "{\"status\":\"error\",\"message\":\"Invalid JSON\"}");
@@ -1852,9 +1025,686 @@ void handleUpdateNetworkSettings() {
   }
 }
 
+void handleGetNetworkSettings() {
+  addCORSHeaders();
+  
+  DynamicJsonDocument doc(512);
+  doc["ssid"] = networkSettings.ssid;
+  doc["password"] = networkSettings.password;
+  doc["subnet"] = networkSettings.subnet;
+  doc["sta_ssid"] = networkSettings.sta_ssid;
+  doc["sta_password"] = networkSettings.sta_password;
+  doc["ap_mode_enabled"] = networkSettings.apModeEnabled;
+  doc["configured"] = networkSettings.configured;
+  
+  String json;
+  serializeJson(doc, json);
+  server.send(200, "application/json", json);
+}
+
+const char MAIN_page[] PROGMEM = R"rawliteral(
+<!DOCTYPE html>
+<html>
+<head>
+    <title>VR Head Tracker - MPU6050 Sensor Data</title>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <style>
+        body { font-family: Arial; margin: 20px; background: #f5f5f5; }
+        .container { max-width: 1400px; margin: 0 auto; }
+        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; }
+        .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .stat-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); text-align: center; }
+        .data { background: white; padding: 20px; margin: 10px 0; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        .value { font-size: 24px; font-weight: bold; color: #2c3e50; }
+        .status { padding: 15px; margin: 10px 0; border-radius: 8px; font-weight: bold; }
+        .connected { background: #d4edda; color: #155724; border: 2px solid #c3e6cb; }
+        .disconnected { background: #f8d7da; color: #721c24; border: 2px solid #f5c6cb; }
+        .controls { margin: 20px 0; }
+        button { padding: 12px 20px; margin: 8px; border: none; border-radius: 6px; cursor: pointer; font-size: 16px; transition: all 0.3s; }
+        button:hover { transform: translateY(-2px); box-shadow: 0 4px 8px rgba(0,0,0,0.2); }
+        .btn-primary { background: #007bff; color: white; }
+        .btn-warning { background: #ffc107; color: black; }
+        .btn-danger { background: #dc3545; color: white; }
+        .btn-success { background: #28a745; color: white; }
+        .btn-info { background: #17a2b8; color: white; }
+        .zero-controls { background: #e8f5e8; padding: 20px; margin: 20px 0; border-radius: 10px; border-left: 5px solid #28a745; }
+        .visualization { background: #2c3e50; color: white; padding: 25px; border-radius: 15px; margin: 20px 0; box-shadow: 0 4px 15px rgba(0,0,0,0.3); }
+        .cube-container { width: 300px; height: 300px; margin: 20px auto; perspective: 1000px; }
+        .cube { width: 100%; height: 100%; position: relative; transform-style: preserve-3d; transition: transform 0.1s ease-out; }
+        .face { position: absolute; width: 300px; height: 300px; border: 3px solid #34495e; display: flex; align-items: center; justify-content: center; font-size: 24px; font-weight: bold; color: white; }
+        .front { transform: rotateY(0deg) translateZ(150px); background: rgba(231, 76, 60, 0.8); }
+        .back { transform: rotateY(180deg) translateZ(150px); background: rgba(52, 152, 219, 0.8); }
+        .right { transform: rotateY(90deg) translateZ(150px); background: rgba(46, 204, 113, 0.8); }
+        .left { transform: rotateY(-90deg) translateZ(150px); background: rgba(155, 89, 182, 0.8); }
+        .top { transform: rotateX(90deg) translateZ(150px); background: rgba(241, 196, 15, 0.8); }
+        .bottom { transform: rotateX(-90deg) translateZ(150px); background: rgba(230, 126, 34, 0.8); }
+        .data-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 15px; }
+        .data-item { background: #f8f9fa; padding: 15px; border-radius: 8px; border-left: 4px solid #007bff; }
+        .data-label { font-weight: bold; color: #495057; margin-bottom: 5px; }
+        h1 { color: #2c3e50; text-align: center; margin-bottom: 30px; }
+        h3 { color: #343a40; margin-bottom: 15px; }
+        
+        /* Network devices styles */
+        .devices-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 15px; margin-bottom: 20px; }
+        .device-card { background: white; padding: 15px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .device-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px; }
+        .device-name { font-weight: bold; font-size: 1.1em; }
+        .device-ip { color: #666; font-family: monospace; }
+        .device-mac { color: #888; font-size: 0.9em; font-family: monospace; }
+        .device-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
+        .status-online { background: #d4edda; color: #155724; }
+        .status-offline { background: #f8d7da; color: #721c24; }
+        
+        /* Modal styles */
+        .modal { display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); }
+        .modal-content { background: white; margin: 50px auto; padding: 20px; border-radius: 8px; max-width: 500px; }
+        .form-group { margin-bottom: 15px; }
+        label { display: block; margin-bottom: 5px; font-weight: bold; }
+        input, select { width: 100%; padding: 8px; border: 1px solid #ddd; border-radius: 4px; box-sizing: border-box; }
+        .tab-buttons { display: flex; margin-bottom: 20px; }
+        .tab-btn { padding: 10px 20px; background: #e9ecef; border: none; cursor: pointer; margin-right: 5px; }
+        .tab-btn.active { background: #007bff; color: white; }
+        .tab-content { display: none; }
+        .tab-content.active { display: block; }
+        .wifi-status { padding: 10px; border-radius: 4px; margin-bottom: 15px; }
+        .wifi-connected { background: #d4edda; color: #155724; }
+        .wifi-disconnected { background: #f8d7da; color: #721c24; }
+        .wifi-scanning { background: #fff3cd; color: #856404; }
+        .network-list { max-height: 200px; overflow-y: auto; border: 1px solid #ddd; border-radius: 4px; padding: 10px; }
+        .network-item { padding: 8px; border-bottom: 1px solid #eee; cursor: pointer; }
+        .network-item:hover { background: #f8f9fa; }
+        .network-item:last-child { border-bottom: none; }
+        .network-ssid { font-weight: bold; }
+        .network-info { font-size: 0.8em; color: #666; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>VR Head Tracker - MPU6050 Sensor Data</h1>
+            <p>Real-time 3D orientation visualization and network monitoring</p>
+        </div>
+        
+        <div class="stats">
+            <div class="stat-card">
+                <h3>Total Devices</h3>
+                <p id="total-devices">0</p>
+            </div>
+            <div class="stat-card">
+                <h3>Online Devices</h3>
+                <p id="online-devices">0</p>
+            </div>
+            <div class="stat-card">
+                <h3>ESP IP</h3>
+                <p id="esp-ip">0.0.0.0</p>
+            </div>
+            <div class="stat-card">
+                <h3>WiFi Status</h3>
+                <p id="wifi-status">-</p>
+            </div>
+            <div class="stat-card">
+                <h3>MPU6050 Status</h3>
+                <p id="mpu-status">-</p>
+            </div>
+        </div>
+        
+        <div class="status" id="status">Disconnected</div>
+        
+        <div class="data">
+            <h3>Sensor Readings</h3>
+            <div class="data-grid">
+                <div class="data-item">
+                    <div class="data-label">Pitch</div>
+                    <div class="value" id="pitch">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Roll</div>
+                    <div class="value" id="roll">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Yaw</div>
+                    <div class="value" id="yaw">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Relative Pitch</div>
+                    <div class="value" id="relPitch">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Relative Roll</div>
+                    <div class="value" id="relRoll">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Relative Yaw</div>
+                    <div class="value" id="relYaw">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Accumulated Pitch</div>
+                    <div class="value" id="accPitch">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Accumulated Roll</div>
+                    <div class="value" id="accRoll">0</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Accumulated Yaw</div>
+                    <div class="value" id="accYaw">0</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="zero-controls">
+            <h3>Zero Point Control</h3>
+            <button class="btn-success" onclick="sendCommand('SET_ZERO')">Set Zero Point</button>
+            <button class="btn-warning" onclick="sendCommand('RESET_ZERO')">Reset Zero</button>
+            <button class="btn-danger" onclick="sendCommand('RESET_ANGLES')">Reset All Angles</button>
+            <div style="margin-top: 15px; padding: 10px; background: white; border-radius: 5px;">
+                <div style="font-size: 14px; color: #666;">
+                    <strong>Zero Point:</strong> <span id="zeroStatus" style="color: #dc3545; font-weight: bold;">Not Set</span>
+                </div>
+                <div style="font-size: 12px; color: #888; margin-top: 8px;">
+                    Zero point allows you to set a reference position. Relative angles show deviation from zero point.
+                    Accumulated angles show total rotation without limits (can exceed 360°).
+                </div>
+            </div>
+        </div>
+
+        <div class="visualization">
+            <h3 style="color: white; text-align: center;">3D Platform Visualization</h3>
+            <div class="cube-container">
+                <div class="cube" id="cube">
+                    <div class="face front">FRONT</div>
+                    <div class="face back">BACK</div>
+                    <div class="face right">RIGHT</div>
+                    <div class="face left">LEFT</div>
+                    <div class="face top">TOP</div>
+                    <div class="face bottom">BOTTOM</div>
+                </div>
+            </div>
+        </div>
+
+        <div class="controls">
+            <h3>Device Controls</h3>
+            <button class="btn-primary" onclick="sendCommand('GET_DATA')">Get Sensor Data</button>
+            <button class="btn-warning" onclick="sendCommand('RECALIBRATE')">Recalibrate</button>
+            <button class="btn-info" onclick="showSettings()">Network Settings</button>
+        </div>
+
+        <div id="devices-container" class="devices-grid">
+            <div class="no-devices">No devices found. Click "Scan Network" to discover devices.</div>
+        </div>
+
+        <div class="data">
+            <h3>API Information</h3>
+            <div style="background: #e9ecef; padding: 15px; border-radius: 5px;">
+                <p><strong>GET /api/status</strong> - Get device status</p>
+                <p><strong>POST /api/setZero</strong> - Set zero point</p>
+                <p><strong>POST /api/resetZero</strong> - Reset zero point</p>
+                <p><strong>GET /api/networkSettings</strong> - Get network settings</p>
+                <p><strong>POST /api/networkSettings</strong> - Update network settings</p>
+            </div>
+        </div>
+        
+        <div class="data">
+            <h3>Last Message</h3>
+            <div id="lastMessage" style="background: #f8f9fa; padding: 10px; border-radius: 5px; font-family: monospace; min-height: 20px;">No data received</div>
+        </div>
+    </div>
+
+    <!-- Network Settings Modal -->
+    <div id="settings-modal" class="modal">
+        <div class="modal-content">
+            <h2>Network Settings</h2>
+            
+            <div class="tab-buttons">
+                <button class="tab-btn active" onclick="showTab('ap-settings')">AP Settings</button>
+                <button class="tab-btn" onclick="showTab('sta-settings')">WiFi Client</button>
+            </div>
+            
+            <form id="settings-form">
+                <div id="ap-settings" class="tab-content active">
+                    <div class="form-group">
+                        <label>
+                            <input type="checkbox" id="ap-mode-enabled" name="ap_mode_enabled" checked>
+                            Enable Access Point Mode
+                        </label>
+                    </div>
+                    <div class="form-group">
+                        <label for="ssid">AP SSID:</label>
+                        <input type="text" id="ssid" name="ssid" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="password">AP Password:</label>
+                        <input type="password" id="password" name="password" required>
+                    </div>
+                    <div class="form-group">
+                        <label for="subnet">Subnet (1-254):</label>
+                        <input type="number" id="subnet" name="subnet" min="1" max="254" required>
+                    </div>
+                </div>
+                
+                <div id="sta-settings" class="tab-content">
+                    <div id="wifi-status-display" class="wifi-status wifi-disconnected">
+                        WiFi Status: Not Connected
+                    </div>
+                    <div class="form-group">
+                        <label for="sta-ssid">WiFi SSID:</label>
+                        <div style="display: flex;">
+                            <input type="text" id="sta-ssid" name="sta_ssid" style="flex: 1;">
+                            <button type="button" onclick="showNetworkList()" style="margin-left: 10px;">Select</button>
+                        </div>
+                    </div>
+                    <div class="form-group">
+                        <label for="sta-password">WiFi Password:</label>
+                        <input type="password" id="sta-password" name="sta_password">
+                    </div>
+                    <div class="form-group">
+                        <button type="button" onclick="scanWiFiNetworks()">Scan Networks</button>
+                    </div>
+                    <div id="network-list" class="network-list" style="display: none;">
+                        <div class="network-item">
+                            <div class="network-ssid">Scanning networks...</div>
+                        </div>
+                    </div>
+                </div>
+                
+                <div style="text-align: right; margin-top: 20px;">
+                    <button type="button" onclick="hideSettings()">Cancel</button>
+                    <button type="submit">Save Settings</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let statusDiv = document.getElementById('status');
+        let lastMessageDiv = document.getElementById('lastMessage');
+        let cube = document.getElementById('cube');
+        let zeroStatusSpan = document.getElementById('zeroStatus');
+        let devices = [];
+        let currentSettings = {};
+        
+        function connectWebSocket() {
+            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            const wsUrl = protocol + '//' + window.location.hostname + ':81';
+            
+            ws = new WebSocket(wsUrl);
+            
+            ws.onopen = function() {
+                console.log('WebSocket connected');
+                statusDiv.textContent = 'Connected';
+                statusDiv.className = 'status connected';
+                document.getElementById('mpu-status').textContent = 'Connected';
+                document.getElementById('mpu-status').style.color = '#28a745';
+                
+                // Request initial data
+                sendCommand('GET_DATA');
+                sendCommand('SCAN_NETWORK');
+                loadCurrentSettings();
+            };
+            
+            ws.onmessage = function(event) {
+                console.log('Received:', event.data);
+                lastMessageDiv.textContent = event.data;
+                
+                try {
+                    var data = JSON.parse(event.data);
+                    handleWebSocketMessage(data);
+                    return;
+                } catch (e) {
+                    // Not JSON, handle as sensor data
+                }
+                
+                // Parse sensor data
+                if (event.data.includes('PITCH:') && event.data.includes('ROLL:') && event.data.includes('YAW:')) {
+                    const data = event.data;
+                    
+                    // Parse all data fields
+                    const pitchMatch = data.match(/PITCH:([-\d.]+)/);
+                    const rollMatch = data.match(/ROLL:([-\d.]+)/);
+                    const yawMatch = data.match(/YAW:([-\d.]+)/);
+                    const relPitchMatch = data.match(/REL_PITCH:([-\d.]+)/);
+                    const relRollMatch = data.match(/REL_ROLL:([-\d.]+)/);
+                    const relYawMatch = data.match(/REL_YAW:([-\d.]+)/);
+                    const accPitchMatch = data.match(/ACC_PITCH:([-\d.]+)/);
+                    const accRollMatch = data.match(/ACC_ROLL:([-\d.]+)/);
+                    const accYawMatch = data.match(/ACC_YAW:([-\d.]+)/);
+                    const zeroSetMatch = data.match(/ZERO_SET:(true|false)/);
+                    
+                    if (pitchMatch) {
+                        const pitch = parseFloat(pitchMatch[1]);
+                        document.getElementById('pitch').textContent = pitch.toFixed(1) + '°';
+                    }
+                    if (rollMatch) {
+                        const roll = parseFloat(rollMatch[1]);
+                        document.getElementById('roll').textContent = roll.toFixed(1) + '°';
+                    }
+                    if (yawMatch) {
+                        const yaw = parseFloat(yawMatch[1]);
+                        document.getElementById('yaw').textContent = yaw.toFixed(1) + '°';
+                    }
+                    if (relPitchMatch) {
+                        const relPitch = parseFloat(relPitchMatch[1]);
+                        document.getElementById('relPitch').textContent = relPitch.toFixed(1) + '°';
+                    }
+                    if (relRollMatch) {
+                        const relRoll = parseFloat(relRollMatch[1]);
+                        document.getElementById('relRoll').textContent = relRoll.toFixed(1) + '°';
+                    }
+                    if (relYawMatch) {
+                        const relYaw = parseFloat(relYawMatch[1]);
+                        document.getElementById('relYaw').textContent = relYaw.toFixed(1) + '°';
+                    }
+                    if (accPitchMatch) {
+                        const accPitch = parseFloat(accPitchMatch[1]);
+                        document.getElementById('accPitch').textContent = accPitch.toFixed(1) + '°';
+                    }
+                    if (accRollMatch) {
+                        const accRoll = parseFloat(accRollMatch[1]);
+                        document.getElementById('accRoll').textContent = accRoll.toFixed(1) + '°';
+                    }
+                    if (accYawMatch) {
+                        const accYaw = parseFloat(accYawMatch[1]);
+                        document.getElementById('accYaw').textContent = accYaw.toFixed(1) + '°';
+                    }
+                    if (zeroSetMatch) {
+                        const zeroSet = zeroSetMatch[1] === 'true';
+                        zeroStatusSpan.textContent = zeroSet ? 'Set' : 'Not Set';
+                        zeroStatusSpan.style.color = zeroSet ? '#28a745' : '#dc3545';
+                    }
+                    
+                    // Update 3D visualization
+                    update3DVisualization(pitchMatch[1], rollMatch[1], yawMatch[1]);
+                }
+                
+                // Parse zero point messages
+                if (event.data === 'ZERO_POINT_SET') {
+                    zeroStatusSpan.textContent = 'Set';
+                    zeroStatusSpan.style.color = '#28a745';
+                    showNotification('Zero point set successfully', 'success');
+                }
+                if (event.data === 'ZERO_POINT_RESET') {
+                    zeroStatusSpan.textContent = 'Not Set';
+                    zeroStatusSpan.style.color = '#dc3545';
+                    showNotification('Zero point reset', 'info');
+                }
+                if (event.data.startsWith('ZERO_SET:')) {
+                    zeroStatusSpan.textContent = 'Set';
+                    zeroStatusSpan.style.color = '#28a745';
+                }
+                if (event.data === 'ZERO_RESET') {
+                    zeroStatusSpan.textContent = 'Not Set';
+                    zeroStatusSpan.style.color = '#dc3545';
+                }
+            };
+            
+            ws.onclose = function() {
+                console.log('WebSocket disconnected');
+                statusDiv.textContent = 'Disconnected';
+                statusDiv.className = 'status disconnected';
+                document.getElementById('mpu-status').textContent = 'Disconnected';
+                document.getElementById('mpu-status').style.color = '#dc3545';
+                
+                setTimeout(connectWebSocket, 2000);
+            };
+            
+            ws.onerror = function(error) {
+                console.error('WebSocket error:', error);
+            };
+        }
+        
+        function handleWebSocketMessage(data) {
+            switch(data.type) {
+                case 'devices_list':
+                    updateDevicesList(data);
+                    break;
+                case 'device_update':
+                    updateDevice(data.device);
+                    break;
+                case 'wifi_networks':
+                    updateWifiNetworks(data.networks);
+                    break;
+                case 'current_settings':
+                    currentSettings = data.settings;
+                    updateSettingsForm();
+                    break;
+                case 'settings_updated':
+                    showNotification('Settings updated successfully', 'success');
+                    break;
+            }
+        }
+        
+        function updateDevicesList(data) {
+            devices = data.devices || [];
+            
+            // Update statistics
+            document.getElementById('total-devices').textContent = data.totalDevices || 0;
+            document.getElementById('online-devices').textContent = data.onlineDevices || 0;
+            document.getElementById('esp-ip').textContent = data.espIp || '0.0.0.0';
+            
+            var wifiStatus = document.getElementById('wifi-status');
+            if (data.wifiStatus === 'connected') {
+                wifiStatus.textContent = 'Connected';
+                wifiStatus.style.color = '#28a745';
+            } else {
+                wifiStatus.textContent = 'Disconnected';
+                wifiStatus.style.color = '#dc3545';
+            }
+            
+            // Update devices grid
+            var container = document.getElementById('devices-container');
+            
+            if (devices.length === 0) {
+                container.innerHTML = '<div class="no-devices">No devices found. Click "Scan Network" to discover devices.</div>';
+                return;
+            }
+            
+            container.innerHTML = '';
+            
+            devices.forEach(function(device) {
+                var deviceCard = createDeviceCard(device);
+                container.appendChild(deviceCard);
+            });
+        }
+        
+        function createDeviceCard(device) {
+            var card = document.createElement('div');
+            card.className = 'device-card';
+            
+            var statusClass = device.connected ? 'status-online' : 'status-offline';
+            var statusText = device.connected ? 'Online' : 'Offline';
+            
+            card.innerHTML = '<div class="device-header">' +
+                '<div class="device-name">' + escapeHtml(device.hostname) + '</div>' +
+                '<span class="device-status ' + statusClass + '">' + statusText + '</span>' +
+                '</div>' +
+                '<div class="device-ip">' + escapeHtml(device.ip) + '</div>' +
+                '<div class="device-mac">' + escapeHtml(device.mac) + '</div>';
+            
+            return card;
+        }
+        
+        function update3DVisualization(pitch, roll, yaw) {
+            // Apply rotation to the 3D cube
+            cube.style.transform = `rotateX(${roll}deg) rotateY(${yaw}deg) rotateZ(${pitch}deg)`;
+        }
+        
+        function sendCommand(command) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(command);
+                console.log('Sent command:', command);
+            } else {
+                console.log('WebSocket not connected');
+                showNotification('WebSocket not connected', 'error');
+            }
+        }
+        
+        function scanNetwork() {
+            sendCommand('SCAN_NETWORK');
+        }
+        
+        function scanWiFiNetworks() {
+            sendCommand('SCAN_WIFI');
+            document.getElementById('wifi-status-display').className = 'wifi-status wifi-scanning';
+            document.getElementById('wifi-status-display').textContent = 'Scanning WiFi networks...';
+        }
+        
+        function updateWifiNetworks(networks) {
+            var networkList = document.getElementById('network-list');
+            networkList.innerHTML = '';
+            
+            if (networks && networks.length > 0) {
+                networks.forEach(function(network) {
+                    var networkItem = document.createElement('div');
+                    networkItem.className = 'network-item';
+                    networkItem.innerHTML = '<div class="network-ssid">' + escapeHtml(network.ssid) + '</div>' +
+                        '<div class="network-info">RSSI: ' + network.rssi + ' dBm, ' + network.encryption + '</div>';
+                    networkItem.onclick = function() {
+                        document.getElementById('sta-ssid').value = network.ssid;
+                        networkList.style.display = 'none';
+                    };
+                    networkList.appendChild(networkItem);
+                });
+                
+                document.getElementById('wifi-status-display').className = 'wifi-status wifi-disconnected';
+                document.getElementById('wifi-status-display').textContent = 'Found ' + networks.length + ' networks';
+            } else {
+                document.getElementById('wifi-status-display').className = 'wifi-status wifi-disconnected';
+                document.getElementById('wifi-status-display').textContent = 'No networks found';
+            }
+        }
+        
+        function loadCurrentSettings() {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({type: 'get_settings'}));
+            }
+        }
+        
+        function updateSettingsForm() {
+            document.getElementById('ssid').value = currentSettings.ssid || '';
+            document.getElementById('password').value = currentSettings.password || '';
+            document.getElementById('subnet').value = currentSettings.subnet || '50';
+            document.getElementById('sta-ssid').value = currentSettings.sta_ssid || '';
+            document.getElementById('sta-password').value = currentSettings.sta_password || '';
+            document.getElementById('ap-mode-enabled').checked = currentSettings.ap_mode_enabled !== false;
+        }
+        
+        function showSettings() {
+            loadCurrentSettings();
+            document.getElementById('settings-modal').style.display = 'block';
+        }
+        
+        function hideSettings() {
+            document.getElementById('settings-modal').style.display = 'none';
+        }
+        
+        function showTab(tabId) {
+            // Hide all tabs
+            var tabs = document.querySelectorAll('.tab-content');
+            tabs.forEach(function(tab) {
+                tab.classList.remove('active');
+            });
+            var buttons = document.querySelectorAll('.tab-btn');
+            buttons.forEach(function(btn) {
+                btn.classList.remove('active');
+            });
+            
+            // Show selected tab
+            document.getElementById(tabId).classList.add('active');
+            event.target.classList.add('active');
+        }
+        
+        function showNetworkList() {
+            var networkList = document.getElementById('network-list');
+            networkList.style.display = networkList.style.display === 'none' ? 'block' : 'none';
+        }
+        
+        function showNotification(message, type = 'info') {
+            // Create notification element
+            const notification = document.createElement('div');
+            notification.textContent = message;
+            notification.style.cssText = `
+                position: fixed;
+                top: 20px;
+                right: 20px;
+                padding: 15px 20px;
+                border-radius: 5px;
+                color: white;
+                font-weight: bold;
+                z-index: 1000;
+                background: ${type === 'success' ? '#28a745' : type === 'error' ? '#dc3545' : '#17a2b8'};
+                box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+            `;
+            
+            document.body.appendChild(notification);
+            
+            // Remove after 3 seconds
+            setTimeout(() => {
+                if (notification.parentNode) {
+                    notification.parentNode.removeChild(notification);
+                }
+            }, 3000);
+        }
+        
+        function escapeHtml(unsafe) {
+            return unsafe
+                .replace(/&/g, "&amp;")
+                .replace(/</g, "&lt;")
+                .replace(/>/g, "&gt;")
+                .replace(/"/g, "&quot;")
+                .replace(/'/g, "&#039;");
+        }
+
+        // Form submissions
+        document.getElementById('settings-form').addEventListener('submit', function(e) {
+            e.preventDefault();
+            var formData = new FormData(this);
+            var settings = {
+                ssid: formData.get('ssid'),
+                password: formData.get('password'),
+                subnet: formData.get('subnet'),
+                sta_ssid: formData.get('sta_ssid'),
+                sta_password: formData.get('sta_password'),
+                ap_mode_enabled: document.getElementById('ap-mode-enabled').checked
+            };
+            
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify({
+                    type: 'update_network_settings',
+                    settings: settings
+                }));
+            }
+            
+            hideSettings();
+        });
+
+        // Initialize when page loads
+        window.addEventListener('load', function() {
+            connectWebSocket();
+        });
+        
+        // Close modals when clicking outside
+        window.onclick = function(event) {
+            var modals = document.getElementsByClassName('modal');
+            for (var i = 0; i < modals.length; i++) {
+                if (event.target == modals[i]) {
+                    modals[i].style.display = 'none';
+                }
+            }
+        };
+    </script>
+</body>
+</html>
+)rawliteral";
+
+void handleRoot() {
+  server.send_P(200, "text/html", MAIN_page);
+}
+
 void setup() {
   Serial.begin(115200);
-  Serial.println("\nStarting ESP8266 MPU6050 Monitor...");
+  Serial.println("\nStarting VR Head Tracker...");
 
   // Инициализация EEPROM
   EEPROM.begin(2048);
@@ -1879,10 +1729,29 @@ void setup() {
       Serial.println("WiFi AP started successfully");
       Serial.printf("SSID: %s\n", networkSettings.ssid);
       Serial.printf("IP address: %s\n", WiFi.softAPIP().toString().c_str());
-      wifiFailure = false;
     } else {
       Serial.println("Failed to start WiFi AP");
-      wifiFailure = true;
+    }
+  }
+  
+  // Подключение к WiFi как клиент (если настроено)
+  if (strlen(networkSettings.sta_ssid) > 0) {
+    Serial.print("Connecting to WiFi ");
+    Serial.println(networkSettings.sta_ssid);
+    
+    WiFi.begin(networkSettings.sta_ssid, networkSettings.sta_password);
+    
+    int attempts = 0;
+    while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+      delay(1000);
+      Serial.print(".");
+      attempts++;
+    }
+    
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("\nConnected! IP: " + WiFi.localIP().toString());
+    } else {
+      Serial.println("\nFailed to connect to WiFi");
     }
   }
   
@@ -1907,21 +1776,32 @@ void setup() {
   
   // Настройка веб-сервера
   server.on("/", handleRoot);
-  server.on("/update_network_settings", HTTP_POST, handleUpdateNetworkSettings);
+  server.on("/api/status", HTTP_GET, handleAPIStatus);
+  server.on("/api/setZero", HTTP_POST, handleSetZero);
+  server.on("/api/resetZero", HTTP_POST, handleResetZero);
+  server.on("/api/networkSettings", HTTP_GET, handleGetNetworkSettings);
+  server.on("/api/networkSettings", HTTP_POST, handleNetworkSettings);
   
+  server.on("/api/status", HTTP_OPTIONS, handleOptions);
+  server.on("/api/setZero", HTTP_OPTIONS, handleOptions);
+  server.on("/api/resetZero", HTTP_OPTIONS, handleOptions);
+  server.on("/api/networkSettings", HTTP_OPTIONS, handleOptions);
+  
+  server.enableCORS(true);
   server.begin();
-  Serial.println("HTTP server started");
   
   // Запуск WebSocket сервера
   webSocket.begin();
   webSocket.onEvent(webSocketEvent);
-  Serial.println("WebSocket server started");
+  
+  Serial.println("HTTP server started on port 80");
+  Serial.println("WebSocket server started on port 81");
   
   // Первоначальное сканирование сети
   scanNetwork();
   
   Serial.println("Setup completed");
-  Serial.println("MPU6050 3D visualization available at: " + WiFi.softAPIP().toString());
+  Serial.println("VR Head Tracker available at: " + WiFi.softAPIP().toString());
 }
 
 void loop() {
@@ -1934,48 +1814,32 @@ void loop() {
   
   if (!calibrated) return;
   
-  // Чтение данных с MPU6050
   sensors_event_t a, g, temp;
-  if (!mpu.getEvent(&a, &g, &temp)) {
-    Serial.println("Error reading MPU6050");
-    delay(100);
-    return;
-  }
+  mpu.getEvent(&a, &g, &temp);
   
   unsigned long currentTime = millis();
   float deltaTime = (currentTime - lastTime) / 1000.0;
-  if (lastTime == 0 || deltaTime > 1.0) {
-    deltaTime = 0.01; // Защита от больших deltaTime
-  }
+  if (lastTime == 0) deltaTime = 0.01;
   lastTime = currentTime;
   
-  // Корректируем данные гироскопа
   float gyroX = g.gyro.x - gyroOffsetX;
   float gyroY = g.gyro.y - gyroOffsetY;
   float gyroZ = g.gyro.z - gyroOffsetZ;
   
-  // Обновляем углы на основе данных гироскопа
+  float accelPitch = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  float accelRoll = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
+  
   pitch += gyroX * deltaTime * 180.0 / PI;
   roll += gyroY * deltaTime * 180.0 / PI;
   yaw += gyroZ * deltaTime * 180.0 / PI;
   
-  // Ограничение углов для отображения в диапазоне -180 до 180 градусов
-  if (pitch > 180) pitch -= 360;
-  else if (pitch < -180) pitch += 360;
+  float alpha = 0.96;
+  pitch = alpha * pitch + (1.0 - alpha) * accelPitch;
+  roll = alpha * roll + (1.0 - alpha) * accelRoll;
   
-  if (roll > 180) roll -= 360;
-  else if (roll < -180) roll += 360;
-  
-  if (yaw > 180) yaw -= 360;
-  else if (yaw < -180) yaw += 360;
-  
-  // Отправка данных через WebSocket
   if (clientConnected && (currentTime - lastDataSend >= SEND_INTERVAL)) {
     if (dataChanged() || lastDataSend == 0) {
-      sendMPU6050Data();
-      lastSentPitch = pitch;
-      lastSentRoll = roll;
-      lastSentYaw = yaw;
+      sendSensorData();
       lastDataSend = currentTime;
     }
   }
@@ -1983,6 +1847,13 @@ void loop() {
   // Периодическое сканирование сети
   if (currentTime - lastScanTime > SCAN_INTERVAL) {
     scanNetwork();
+  }
+  
+  // Периодическое сохранение в EEPROM
+  if (eepromDirty && (currentTime - lastEEPROMSave > EEPROM_SAVE_INTERVAL)) {
+    saveNetworkSettingsToEEPROM();
+    eepromDirty = false;
+    lastEEPROMSave = currentTime;
   }
   
   delay(10);
