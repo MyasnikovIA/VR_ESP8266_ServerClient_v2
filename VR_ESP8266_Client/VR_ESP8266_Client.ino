@@ -68,6 +68,7 @@ struct NetworkSettings {
 
 // Sensor data - БЕСКОНЕЧНЫЕ УГЛЫ
 float pitch = 0, roll = 0, yaw = 0; // Теперь бесконечные углы
+float lastSentPitch = 0, lastSentRoll = 0, lastSentYaw = 0;
 float gyroOffsetX = 0, gyroOffsetY = 0, gyroOffsetZ = 0;
 bool calibrated = false;
 unsigned long lastTime = 0;
@@ -85,6 +86,7 @@ bool firstMeasurement = true;
 bool clientConnected = false;
 unsigned long lastDataSend = 0;
 const unsigned long SEND_INTERVAL = 50;
+const float CHANGE_THRESHOLD = 1.0;
 
 // Массив для хранения подключенных устройств
 const int MAX_DEVICES = 10;
@@ -563,6 +565,9 @@ void resetAllAngles() {
   pitch = 0;
   roll = 0;
   yaw = 0;
+  lastSentPitch = 0;
+  lastSentRoll = 0;
+  lastSentYaw = 0;
   accumulatedPitch = 0;
   accumulatedRoll = 0;
   accumulatedYaw = 0;
@@ -690,6 +695,13 @@ void calibrateSensor() {
   Serial.print(" Z: "); Serial.println(gyroOffsetZ, 6);
 }
 
+// Функция проверки изменения данных
+bool dataChanged() {
+  return (abs(pitch - lastSentPitch) >= CHANGE_THRESHOLD ||
+          abs(roll - lastSentRoll) >= CHANGE_THRESHOLD ||
+          abs(yaw - lastSentYaw) >= CHANGE_THRESHOLD);
+}
+
 void sendSensorData() {
   // Обновляем накопленные углы
   updateAccumulatedAngles();
@@ -714,6 +726,9 @@ void sendSensorData() {
                 ",ZERO_YAW:" + String(zeroYawOffset, 2);
   
   webSocket.broadcastTXT(data);
+  lastSentPitch = pitch;
+  lastSentRoll = roll;
+  lastSentYaw = yaw;
 }
 
 void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length) {
@@ -1200,7 +1215,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         .device-name { font-weight: bold; font-size: 1.1em; }
         .device-ip { color: #666; font-family: monospace; }
         .device-mac { color: #888; font-size: 0.9em; font-family: monospace; }
-        .device-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
         .status-online { background: #d4edda; color: #155724; }
         .status-offline { background: #f8d7da; color: #721c24; }
         
@@ -1234,6 +1248,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <h1>VR Head Tracker - MPU6050 Sensor Data</h1>
             <p>Real-time 3D orientation visualization and network monitoring</p>
             <p><strong>Access Point:</strong> <span id="ap-name">VR_Head_Hom_001</span></p>
+            <br/><button class="btn-info" onclick="showSettings()">Network Settings</button>
         </div>
         
         <div class="stats">
@@ -1340,10 +1355,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <h3>Device Controls</h3>
             <button class="btn-primary" onclick="sendCommand('GET_DATA')">Get Sensor Data</button>
             <button class="btn-warning" onclick="sendCommand('RECALIBRATE')">Recalibrate</button>
-            <button class="btn-info" onclick="scanNetwork()">Scan Network</button>
-            <button class="btn-info" onclick="showSettings()">Network Settings</button>
-            <button class="btn-info" onclick="sendCommand('SCAN_WIFI')">Scan WiFi</button>
-            <button class="btn-info" onclick="sendCommand('HELP')">Help</button>
         </div>
 
         <div id="devices-container" class="devices-grid">
@@ -1657,7 +1668,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             
             card.innerHTML = '<div class="device-header">' +
                 '<div class="device-name">' + escapeHtml(device.hostname) + '</div>' +
-                '<span class="device-status ' + statusClass + '">' + statusText + '</span>' +
                 '</div>' +
                 '<div class="device-ip">' + escapeHtml(device.ip) + '</div>' +
                 '<div class="device-mac">' + escapeHtml(device.mac) + '</div>';
@@ -1977,19 +1987,26 @@ void loop() {
   float gyroY = g.gyro.y - gyroOffsetY;
   float gyroZ = g.gyro.z - gyroOffsetZ;
   
-  // ВСЕ оси обновляются ТОЛЬКО данными гироскопа для бесконечного суммирования
-  // УБРАНЫ ОГРАНИЧЕНИЯ УГЛОВ - теперь углы бесконечные
-  pitch += gyroX * deltaTime * 180.0 / PI;  // Только гироскоп для Pitch
-  roll += gyroY * deltaTime * 180.0 / PI;   // Только гироскоп для Roll
-  yaw += gyroZ * deltaTime * 180.0 / PI;    // Только гироскоп для Yaw
+  // Комплементарный фильтр для стабилизации углов
+  float accelPitch = atan2(a.acceleration.y, a.acceleration.z) * 180.0 / PI;
+  float accelRoll = atan2(-a.acceleration.x, sqrt(a.acceleration.y * a.acceleration.y + a.acceleration.z * a.acceleration.z)) * 180.0 / PI;
   
-  // УБРАНЫ ОГРАНИЧЕНИЯ УГЛОВ - теперь углы могут быть любыми
-  // pitch, roll, yaw теперь бесконечные углы
+  // Обновление углов гироскопом
+  pitch += gyroX * deltaTime * 180.0 / PI;
+  roll += gyroY * deltaTime * 180.0 / PI;
+  yaw += gyroZ * deltaTime * 180.0 / PI;
+  
+  // Комплементарный фильтр для стабилизации
+  float alpha = 0.96;
+  pitch = alpha * pitch + (1.0 - alpha) * accelPitch;
+  roll = alpha * roll + (1.0 - alpha) * accelRoll;
   
   // Отправка данных через WebSocket
   if (clientConnected && (currentTime - lastDataSend >= SEND_INTERVAL)) {
-    sendSensorData();
-    lastDataSend = currentTime;
+    if (dataChanged() || lastDataSend == 0) {
+      sendSensorData();
+      lastDataSend = currentTime;
+    }
   }
   
   // Периодическое сканирование сети
