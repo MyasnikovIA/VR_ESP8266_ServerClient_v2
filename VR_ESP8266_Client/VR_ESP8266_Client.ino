@@ -1092,7 +1092,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
         .device-name { font-weight: bold; font-size: 1.1em; }
         .device-ip { color: #666; font-family: monospace; }
         .device-mac { color: #888; font-size: 0.9em; font-family: monospace; }
-        .device-status { display: inline-block; padding: 2px 8px; border-radius: 12px; font-size: 0.8em; }
         .status-online { background: #d4edda; color: #155724; }
         .status-offline { background: #f8d7da; color: #721c24; }
         
@@ -1517,7 +1516,6 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             
             card.innerHTML = '<div class="device-header">' +
                 '<div class="device-name">' + escapeHtml(device.hostname) + '</div>' +
-                '<span class="device-status ' + statusClass + '">' + statusText + '</span>' +
                 '</div>' +
                 '<div class="device-ip">' + escapeHtml(device.ip) + '</div>' +
                 '<div class="device-mac">' + escapeHtml(device.mac) + '</div>';
