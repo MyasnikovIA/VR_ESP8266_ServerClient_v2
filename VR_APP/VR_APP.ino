@@ -5,7 +5,7 @@
 #include <ArduinoJson.h>
 
 // Настройки WiFi по умолчанию
-const char* ap_ssid = "APP_VR_ESP8266";
+const char* ap_ssid = "ESP8266_Network_Monitor";
 const char* ap_password = "12345678";
 
 // Создание веб-сервера на порту 80
@@ -49,12 +49,19 @@ struct FixedIP {
 struct DeviceInfo {
   char ip[16];
   char mac[18];
-  char originalMac[18];
+  char originalMac[18];  // Добавлено для отображения оригинального MAC
   char hostname[32];
   char customName[32];
   int rssi;
   bool ipFixed;
-  bool isVRClient;
+  bool hasMPU6050;
+  float pitch;
+  float roll;
+  float yaw;
+  float relPitch;
+  float relRoll;
+  float relYaw;
+  unsigned long lastUpdate;
   bool connected;
   unsigned long lastSeen;
 };
@@ -116,6 +123,29 @@ bool wifiFailure = false;
 bool memoryFailure = false;
 unsigned long lastRestartAttempt = 0;
 const unsigned long RESTART_INTERVAL = 60000;
+
+// Добавьте эту строку в раздел объявлений функций (примерно после строки 80):
+bool parseMPU6050Data(const String& message, char* deviceName, 
+                     float& pitch, float& roll, float& yaw,
+                     float& relPitch, float& relRoll, float& relYaw);
+                     
+// Вспомогательная функция для извлечения значения из строки с защитой от переполнения
+float extractValue(const String& message, const String& key) {
+  if (message.length() == 0 || key.length() == 0) return 0.0;
+  
+  int keyPos = message.indexOf(key);
+  if (keyPos == -1) return 0.0;
+  
+  int valueStart = keyPos + key.length();
+  if (valueStart >= message.length()) return 0.0;
+  
+  int valueEnd = message.indexOf(',', valueStart);
+  if (valueEnd == -1) valueEnd = message.length();
+  if (valueEnd > valueStart + 15) valueEnd = valueStart + 15; // Ограничение длины
+  
+  String valueStr = message.substring(valueStart, valueEnd);
+  return valueStr.toFloat();
+}
 
 // Безопасное копирование строк с проверкой границ
 void safeStrcpy(char* dest, const char* src, size_t destSize) {
@@ -193,7 +223,7 @@ String getDisplayName(const char* mac, const char* originalHostname) {
 }
 
 // Функция для добавления нового устройства с защитой от переполнения
-bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi, bool isVRClient = false) {
+bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi) {
   if (ip == NULL || mac == NULL) return false;
   
   // Проверяем длину входных данных
@@ -223,15 +253,20 @@ bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi, 
       int fixedIndex = findFixedIPByMAC(mac);
       devices[deviceCount].ipFixed = (fixedIndex != -1);
       
-      devices[deviceCount].isVRClient = isVRClient;
+      devices[deviceCount].hasMPU6050 = false;
+      devices[deviceCount].pitch = 0;
+      devices[deviceCount].roll = 0;
+      devices[deviceCount].yaw = 0;
+      devices[deviceCount].relPitch = 0;
+      devices[deviceCount].relRoll = 0;
+      devices[deviceCount].relYaw = 0;
+      devices[deviceCount].lastUpdate = 0;
       devices[deviceCount].connected = true;
       devices[deviceCount].lastSeen = millis();
       deviceCount++;
       
-      Serial.printf("New device: %s (%s) - %s - RSSI: %d - IP Fixed: %s - VR Client: %s\n", 
-                   hostname ? hostname : "Unknown", ip, mac, rssi, 
-                   devices[deviceCount-1].ipFixed ? "YES" : "NO",
-                   isVRClient ? "YES" : "NO");
+      Serial.printf("New device: %s (%s) - %s - RSSI: %d - IP Fixed: %s\n", 
+                   hostname ? hostname : "Unknown", ip, mac, rssi, devices[deviceCount-1].ipFixed ? "YES" : "NO");
       return true;
     } else {
       Serial.println("Device limit reached!");
@@ -245,26 +280,70 @@ bool addDevice(const char* ip, const char* mac, const char* hostname, int rssi, 
     if (hostname && strlen(hostname) > 0) {
       safeStrcpy(devices[index].hostname, hostname, sizeof(devices[index].hostname));
     }
-    // Обновляем флаг VR клиента если нужно
-    if (isVRClient) {
-      devices[index].isVRClient = true;
-    }
     return true;
   }
 }
 
-// Функция для регистрации VR клиента
-void registerVRClient(const char* ip, const char* deviceName) {
+// Функция для обновления данных MPU6050 от VR-клиента
+void updateVRDeviceData(const char* ip, const char* deviceName, 
+                       float pitch, float roll, float yaw,
+                       float relPitch, float relRoll, float relYaw) {
   if (ip == NULL || deviceName == NULL) return;
   
-  // Создаем MAC адрес на основе имени устройства для VR клиентов
-  char vrMac[32];
-  snprintf(vrMac, sizeof(vrMac), "VR:%s", deviceName);
+  int index = findDeviceByIP(ip);
   
-  // Добавляем устройство как VR клиент
-  addDevice(ip, vrMac, deviceName, -50, true);
-  
-  Serial.printf("VR Client registered: %s (%s) - %s\n", deviceName, ip, vrMac);
+  if (index == -1) {
+    // Создаем новое устройство если не найдено
+    if (deviceCount < MAX_DEVICES) {
+      safeStrcpy(devices[deviceCount].ip, ip, sizeof(devices[deviceCount].ip));
+      
+      char vrMac[32];
+      snprintf(vrMac, sizeof(vrMac), "VR:%s", deviceName);
+      safeStrcpy(devices[deviceCount].mac, vrMac, sizeof(devices[deviceCount].mac));
+      safeStrcpy(devices[deviceCount].originalMac, vrMac, sizeof(devices[deviceCount].originalMac));
+      
+      safeStrcpy(devices[deviceCount].hostname, deviceName, sizeof(devices[deviceCount].hostname));
+      safeStrcpy(devices[deviceCount].customName, "", sizeof(devices[deviceCount].customName));
+      devices[deviceCount].ipFixed = false;
+      devices[deviceCount].hasMPU6050 = true;
+      devices[deviceCount].pitch = pitch;
+      devices[deviceCount].roll = roll;
+      devices[deviceCount].yaw = yaw;
+      devices[deviceCount].relPitch = relPitch;
+      devices[deviceCount].relRoll = relRoll;
+      devices[deviceCount].relYaw = relYaw;
+      devices[deviceCount].lastUpdate = millis();
+      devices[deviceCount].connected = true;
+      devices[deviceCount].lastSeen = millis();
+      deviceCount++;
+      
+      Serial.printf("New VR device: %s (%s) - Pitch: %.1f, Roll: %.1f, Yaw: %.1f\n", 
+                   deviceName, ip, pitch, roll, yaw);
+    } else {
+      Serial.println("Device limit reached! Cannot add new VR device");
+    }
+  } else {
+    // Обновляем существующее устройство
+    devices[index].hasMPU6050 = true;
+    devices[index].pitch = pitch;
+    devices[index].roll = roll;
+    devices[index].yaw = yaw;
+    devices[index].relPitch = relPitch;
+    devices[index].relRoll = relRoll;
+    devices[index].relYaw = relYaw;
+    devices[index].lastUpdate = millis();
+    devices[index].connected = true;
+    devices[index].lastSeen = millis();
+    
+    if (deviceName && strlen(deviceName) > 0) {
+      safeStrcpy(devices[index].hostname, deviceName, sizeof(devices[index].hostname));
+    }
+    
+    // Отправляем обновление через WebSocket всем веб-клиентам
+    sendDeviceUpdateToWebClients(&devices[index]);
+    
+    Serial.printf("VR data updated for %s: Pitch=%.1f, Roll=%.1f, Yaw=%.1f\n", ip, pitch, roll, yaw);
+  }
 }
 
 // Функция для отправки обновления устройства веб-клиентам
@@ -275,14 +354,20 @@ void sendDeviceUpdateToWebClients(DeviceInfo* device) {
     return;
   }
   
-  doc["type"] = "device_update";
+  doc["type"] = "sensor_update";
   JsonObject deviceObj = doc.createNestedObject("device");
   deviceObj["ip"] = device->ip;
   deviceObj["mac"] = device->mac;
   deviceObj["originalMac"] = device->originalMac;
   deviceObj["hostname"] = device->hostname;
   deviceObj["displayName"] = getDisplayName(device->mac, device->hostname);
-  deviceObj["isVRClient"] = device->isVRClient;
+  deviceObj["hasMPU6050"] = device->hasMPU6050;
+  deviceObj["pitch"] = device->pitch;
+  deviceObj["roll"] = device->roll;
+  deviceObj["yaw"] = device->yaw;
+  deviceObj["relPitch"] = device->relPitch;
+  deviceObj["relRoll"] = device->relRoll;
+  deviceObj["relYaw"] = device->relYaw;
   deviceObj["connected"] = device->connected;
   deviceObj["ipFixed"] = device->ipFixed;
   deviceObj["rssi"] = device->rssi;
@@ -301,6 +386,34 @@ void sendDevicesListToWebClients() {
   
   JsonArray devicesArray = doc.createNestedArray("devices");
   
+  // Временный массив для объединения устройств по IP
+  struct MergedDevice {
+    String ip;
+    bool processed;
+    int deviceIndex;
+  };
+  
+  MergedDevice mergedDevices[MAX_DEVICES];
+  int mergedCount = 0;
+  
+  // Сначала собираем все уникальные IP
+  for (int i = 0; i < deviceCount; i++) {
+    bool ipExists = false;
+    for (int j = 0; j < mergedCount; j++) {
+      if (mergedDevices[j].ip == devices[i].ip) {
+        ipExists = true;
+        break;
+      }
+    }
+    
+    if (!ipExists) {
+      mergedDevices[mergedCount].ip = devices[i].ip;
+      mergedDevices[mergedCount].processed = false;
+      mergedDevices[mergedCount].deviceIndex = i;
+      mergedCount++;
+    }
+  }
+  
   // Подсчитываем статистику
   int onlineCount = 0;
   int vrCount = 0;
@@ -308,23 +421,81 @@ void sendDevicesListToWebClients() {
   
   for (int i = 0; i < deviceCount; i++) {
     if (devices[i].connected) onlineCount++;
-    if (devices[i].isVRClient) vrCount++;
+    if (devices[i].hasMPU6050) vrCount++;
     if (devices[i].ipFixed) fixedCount++;
   }
   
-  // Добавляем все устройства в список
-  for (int i = 0; i < deviceCount; i++) {
+  // Обрабатываем каждый уникальный IP
+  for (int i = 0; i < mergedCount; i++) {
+    if (mergedDevices[i].processed) continue;
+    
+    String currentIP = mergedDevices[i].ip;
+    
+    // Ищем все устройства с этим IP
+    DeviceInfo* vrDevice = nullptr;
+    DeviceInfo* normalDevice = nullptr;
+    
+    for (int j = 0; j < deviceCount; j++) {
+      if (String(devices[j].ip) == currentIP) {
+        if (devices[j].hasMPU6050) {
+          vrDevice = &devices[j];
+        } else {
+          normalDevice = &devices[j];
+        }
+        mergedDevices[i].processed = true;
+      }
+    }
+    
+    // Создаем объединенное устройство
     JsonObject deviceObj = devicesArray.createNestedObject();
     
-    deviceObj["ip"] = devices[i].ip;
-    deviceObj["mac"] = devices[i].mac;
-    deviceObj["originalMac"] = devices[i].originalMac;
-    deviceObj["hostname"] = devices[i].hostname;
-    deviceObj["displayName"] = getDisplayName(devices[i].mac, devices[i].hostname);
-    deviceObj["rssi"] = devices[i].rssi;
-    deviceObj["ipFixed"] = devices[i].ipFixed;
-    deviceObj["isVRClient"] = devices[i].isVRClient;
-    deviceObj["connected"] = devices[i].connected;
+    if (vrDevice != nullptr) {
+      // Используем данные VR устройства как основу
+      deviceObj["ip"] = vrDevice->ip;
+      deviceObj["mac"] = vrDevice->mac;
+      deviceObj["originalMac"] = vrDevice->originalMac;
+      deviceObj["hostname"] = vrDevice->hostname;
+      deviceObj["displayName"] = getDisplayName(vrDevice->mac, vrDevice->hostname);
+      deviceObj["rssi"] = vrDevice->rssi;
+      deviceObj["ipFixed"] = vrDevice->ipFixed;
+      deviceObj["hasMPU6050"] = vrDevice->hasMPU6050;
+      deviceObj["connected"] = vrDevice->connected;
+      
+      // Данные сенсора
+      deviceObj["pitch"] = vrDevice->pitch;
+      deviceObj["roll"] = vrDevice->roll;
+      deviceObj["yaw"] = vrDevice->yaw;
+      deviceObj["relPitch"] = vrDevice->relPitch;
+      deviceObj["relRoll"] = vrDevice->relRoll;
+      deviceObj["relYaw"] = vrDevice->relYaw;
+      
+    } else if (normalDevice != nullptr) {
+      // Используем данные обычного устройства
+      deviceObj["ip"] = normalDevice->ip;
+      deviceObj["mac"] = normalDevice->mac;
+      deviceObj["originalMac"] = normalDevice->originalMac;
+      deviceObj["hostname"] = normalDevice->hostname;
+      deviceObj["displayName"] = getDisplayName(normalDevice->mac, normalDevice->hostname);
+      deviceObj["rssi"] = normalDevice->rssi;
+      deviceObj["ipFixed"] = normalDevice->ipFixed;
+      deviceObj["hasMPU6050"] = normalDevice->hasMPU6050;
+      deviceObj["connected"] = normalDevice->connected;
+    }
+    
+    // Если есть оба типа устройств, объединяем лучшие атрибуты
+    if (vrDevice != nullptr && normalDevice != nullptr) {
+      // Предпочитаем MAC адрес из нормального устройства (он настоящий)
+      if (strlen(normalDevice->mac) > 0) {
+        deviceObj["mac"] = normalDevice->mac;
+        deviceObj["originalMac"] = normalDevice->originalMac;
+      }
+      
+      // Предпочитаем настройки IP из нормального устройства
+      deviceObj["ipFixed"] = normalDevice->ipFixed;
+      
+      // Состояние подключения берем из VR устройства (оно более актуально)
+      deviceObj["connected"] = vrDevice->connected;
+    }
   }
   
   doc["type"] = "devices_list";
@@ -363,16 +534,37 @@ void scanNetwork() {
     IPAddress ipAddr = IPAddress(station->ip);
     snprintf(ip, sizeof(ip), "%d.%d.%d.%d", ipAddr[0], ipAddr[1], ipAddr[2], ipAddr[3]);
     
-    // Добавляем устройство
-    addDevice(ip, mac, "WiFi Client", -50);
+    // Проверяем, является ли устройство VR-устройством
+    bool isVRDevice = false;
+    for (int i = 0; i < deviceCount; i++) {
+      if (strcmp(devices[i].mac, mac) == 0 && devices[i].hasMPU6050) {
+        isVRDevice = true;
+        break;
+      }
+    }
+    
+    // Добавляем устройство только если:
+    // 1. Это VR-устройство, ИЛИ
+    // 2. Это не дубликат (по MAC-адресу)
+    if (isVRDevice || findDeviceByMAC(mac) == -1) {
+      // Используем фиксированное значение RSSI, так как структура не содержит эту информацию
+      addDevice(ip, mac, "WiFi Client", -50);
+    } else {
+      Serial.printf("Skipping duplicate device: %s (%s)\n", mac, ip);
+    }
     
     station = STAILQ_NEXT(station, next);
   }
   wifi_softap_free_station_info();
   
-  // Помечаем устройства как отключенные если не видели их больше минуты
+  // Помечаем VR-устройства как онлайн если они обновлялись недавно
   unsigned long currentTime = millis();
   for (int i = 0; i < deviceCount; i++) {
+    if (devices[i].hasMPU6050 && (currentTime - devices[i].lastUpdate) < 30000) {
+      devices[i].connected = true;
+    }
+    
+    // Помечаем устройства как отключенные если не видели их больше минуты
     if ((currentTime - devices[i].lastSeen) > 60000) {
       devices[i].connected = false;
     }
@@ -891,6 +1083,78 @@ void sendCORSResponse(int code, const String& content_type, const String& conten
   server.send(code, content_type, content);
 }
 
+// API для калибровки датчика с CORS
+void handleApiCalibrate() {
+  if (server.method() == HTTP_POST) {
+    String ip = server.arg("ip");
+    Serial.printf("Calibration request for device: %s\n", ip.c_str());
+    
+    // Находим устройство по IP
+    int deviceIndex = findDeviceByIP(ip.c_str());
+    if (deviceIndex != -1 && devices[deviceIndex].hasMPU6050) {
+      // Отправляем команду калибровки через WebSocket
+      bool commandSent = false;
+      for (int i = 0; i < webSocket.connectedClients(); i++) {
+        IPAddress clientIp = webSocket.remoteIP(i);
+        if (clientIp.toString() == ip) {
+          webSocket.sendTXT(i, "CALIBRATE_SENSOR");
+          commandSent = true;
+          Serial.printf("Calibration command sent to %s\n", ip.c_str());
+          break;
+        }
+      }
+      
+      if (commandSent) {
+        sendCORSResponse(200, "application/json", "{\"status\":\"success\",\"message\":\"Calibration command sent\"}");
+      } else {
+        sendCORSResponse(404, "application/json", "{\"status\":\"error\",\"message\":\"VR device not connected\"}");
+      }
+    } else {
+      sendCORSResponse(404, "application/json", "{\"status\":\"error\",\"message\":\"Device not found or not a VR device\"}");
+    }
+  } else if (server.method() == HTTP_OPTIONS) {
+    handleOptions();
+  } else {
+    sendCORSResponse(405, "application/json", "{\"status\":\"error\",\"message\":\"Method not allowed\"}");
+  }
+}
+
+// API для сброса углов с CORS
+void handleApiReset() {
+  if (server.method() == HTTP_POST) {
+    String ip = server.arg("ip");
+    Serial.printf("Reset angles request for device: %s\n", ip.c_str());
+    
+    // Находим устройство по IP
+    int deviceIndex = findDeviceByIP(ip.c_str());
+    if (deviceIndex != -1 && devices[deviceIndex].hasMPU6050) {
+      // Отправляем команду сброса через WebSocket
+      bool commandSent = false;
+      for (int i = 0; i < webSocket.connectedClients(); i++) {
+        IPAddress clientIp = webSocket.remoteIP(i);
+        if (clientIp.toString() == ip) {
+          webSocket.sendTXT(i, "RESET_ANGLES");
+          commandSent = true;
+          Serial.printf("Reset angles command sent to %s\n", ip.c_str());
+          break;
+        }
+      }
+      
+      if (commandSent) {
+        sendCORSResponse(200, "application/json", "{\"status\":\"success\",\"message\":\"Reset command sent\"}");
+      } else {
+        sendCORSResponse(404, "application/json", "{\"status\":\"error\",\"message\":\"VR device not connected\"}");
+      }
+    } else {
+      sendCORSResponse(404, "application/json", "{\"status\":\"error\",\"message\":\"Device not found or not a VR device\"}");
+    }
+  } else if (server.method() == HTTP_OPTIONS) {
+    handleOptions();
+  } else {
+    sendCORSResponse(405, "application/json", "{\"status\":\"error\",\"message\":\"Method not allowed\"}");
+  }
+}
+
 // API для переименования устройства с CORS
 void handleApiRename() {
   if (server.method() == HTTP_POST) {
@@ -1078,14 +1342,14 @@ void handleApiSettings() {
   }
 }
 
-// HTML страница
+// ВАЖНО: Восстанавливаем оригинальную HTML страницу
 const char htmlPage[] PROGMEM = R"rawliteral(
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
-    <title>ESP8266 Network Monitor</title>
+    <title>VR Tracking Server</title>
     <style>
         body { font-family: Arial; margin: 10px; background: #f0f0f0; }
         .container { max-width: 1000px; margin: 0 auto; background: white; padding: 15px; border-radius: 8px; }
@@ -1107,6 +1371,14 @@ const char htmlPage[] PROGMEM = R"rawliteral(
         .info-row { display: flex; justify-content: space-between; margin-bottom: 2px; font-size: 11px; }
         .info-label { color: #7f8c8d; }
         .info-value { color: #2c3e50; font-family: monospace; }
+        .sensor-data { background: #f8f9fa; padding: 5px; border-radius: 3px; margin-top: 5px; border: 1px solid #e9ecef; }
+        .sensor-row { display: flex; justify-content: space-between; margin-bottom: 1px; font-size: 10px; }
+        .sensor-label { color: #6c757d; }
+        .sensor-value { color: #e74c3c; font-weight: bold; }
+        .sensor-controls { display: flex; gap: 5px; margin-top: 5px; }
+        .sensor-btn { padding: 3px 8px; border: none; border-radius: 3px; background: #3498db; color: white; cursor: pointer; font-size: 9px; flex: 1; }
+        .sensor-btn.calibrate { background: #f39c12; }
+        .sensor-btn.reset { background: #e74c3c; }
         .ip-controls { display: flex; gap: 5px; margin-top: 5px; }
         .ip-btn { padding: 3px 8px; border: none; border-radius: 3px; background: #9b59b6; color: white; cursor: pointer; font-size: 9px; flex: 1; }
         .ip-btn.fix { background: #27ae60; }
@@ -1133,8 +1405,8 @@ const char htmlPage[] PROGMEM = R"rawliteral(
 <body>
     <div class="container">
         <div class="header">
-            <h1 style="margin:0;font-size:20px;">🌐 ESP8266 Network Monitor</h1>
-            <p style="margin:5px 0 0 0;font-size:12px;">Network device management with VR client support</p>
+            <h1 style="margin:0;font-size:20px;">🎮 VR Tracking Server</h1>
+            <p style="margin:5px 0 0 0;font-size:12px;">Real-time MPU6050 device monitoring with IP management</p>
         </div>
         
         <div class="stats">
@@ -1148,7 +1420,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
             </div>
             <div class="stat-card">
                 <div class="stat-number" id="vrDevices">0</div>
-                <div class="stat-label">VR Clients</div>
+                <div class="stat-label">VR Headsets</div>
             </div>
             <div class="stat-card">
                 <div class="stat-number" id="fixedIPs">0</div>
@@ -1196,7 +1468,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
             </div>
             <div class="form-group">
                 <label class="form-label">Subnet (1-254):</label>
-                <input type="number" id="settingsSubnet" class="form-input" value="50" min="1" max="254">
+                <input type="number" id="settingsSubnet" class="form-input" value="4" min="1" max="254">
             </div>
             <div class="modal-buttons">
                 <button class="btn" onclick="closeModal('settingsModal')">Cancel</button>
@@ -1289,8 +1561,8 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                     
                     if (data.type === 'devices_list') {
                         updateDisplay(data);
-                    } else if (data.type === 'device_update') {
-                        updateDeviceData(data.device);
+                    } else if (data.type === 'sensor_update') {
+                        updateSensorData(data.device);
                     } else if (data.type === 'connected') {
                         console.log('WebSocket: ' + data.message);
                     } else if (data.type === 'command_response') {
@@ -1316,18 +1588,22 @@ const char htmlPage[] PROGMEM = R"rawliteral(
             };
         }
         
-        function updateDeviceData(deviceData) {
+        function updateSensorData(deviceData) {
             const deviceCard = document.querySelector(`[data-ip="${deviceData.ip}"]`);
-            if (deviceCard) {
-                // Обновляем статус подключения
-                const statusElement = deviceCard.querySelector('.device-status');
-                if (statusElement) {
-                    statusElement.className = `device-status ${deviceData.connected ? 'status-online' : 'status-offline'}`;
-                    statusElement.textContent = deviceData.connected ? 'Online' : 'Offline';
+            if (deviceCard && deviceData.hasMPU6050) {
+                // Находим все элементы сенсоров
+                const sensorValues = deviceCard.querySelectorAll('.sensor-value');
+                if (sensorValues.length >= 6) {
+                    sensorValues[0].textContent = deviceData.pitch.toFixed(1) + '°';
+                    sensorValues[1].textContent = deviceData.roll.toFixed(1) + '°';
+                    sensorValues[2].textContent = deviceData.yaw.toFixed(1) + '°';
+                    sensorValues[3].textContent = deviceData.relPitch.toFixed(1) + '°';
+                    sensorValues[4].textContent = deviceData.relRoll.toFixed(1) + '°';
+                    sensorValues[5].textContent = deviceData.relYaw.toFixed(1) + '°';
                 }
                 
                 // Обновляем время последнего обновления
-                const updateTime = deviceCard.querySelector('.last-update-time');
+                const updateTime = deviceCard.querySelector('.last-sensor-update');
                 if (updateTime) {
                     updateTime.textContent = new Date().toLocaleTimeString();
                 }
@@ -1347,6 +1623,18 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                 console.error('WebSocket not connected');
                 showNotification('WebSocket not connected. Please wait for connection...', 'error');
                 return false;
+            }
+        }
+        
+        function calibrateSensor(ip) {
+            if (sendWebSocketCommand('calibrate', { ip: ip })) {
+                showNotification('Calibration command sent', 'info');
+            }
+        }
+        
+        function resetAngles(ip) {
+            if (sendWebSocketCommand('reset_angles', { ip: ip })) {
+                showNotification('Reset angles command sent', 'info');
             }
         }
         
@@ -1463,11 +1751,11 @@ const char htmlPage[] PROGMEM = R"rawliteral(
             }
             
             container.innerHTML = data.devices.map(device => `
-                <div class="device-card ${device.isVRClient ? 'vr-device' : ''} ${device.ipFixed ? 'ip-fixed' : ''}" data-ip="${device.ip}">
+                <div class="device-card ${device.hasMPU6050 ? 'vr-device' : ''} ${device.ipFixed ? 'ip-fixed' : ''}" data-ip="${device.ip}">
                     <div class="device-header">
                         <div class="device-name" onclick="editDeviceName('${device.mac}', '${device.displayName.replace(/'/g, "\\'")}')">
                             ${getDeviceIcon(device)} ${device.displayName}
-                            ${device.isVRClient ? '<span class="vr-badge">VR</span>' : ''}
+                            ${device.hasMPU6050 ? '<span class="vr-badge">VR</span>' : ''}
                             ${device.ipFixed ? '<span class="fixed-badge">FIXED</span>' : ''}
                         </div>
                         <div class="device-status ${device.connected ? 'status-online' : 'status-offline'}">
@@ -1486,25 +1774,53 @@ const char htmlPage[] PROGMEM = R"rawliteral(
                         <span class="info-label">Original MAC:</span>
                         <span class="info-value">${formatMac(device.originalMac)}</span>
                     </div>
-                    <div class="info-row">
-                        <span class="info-label">RSSI:</span>
-                        <span class="info-value">${device.rssi} dBm</span>
-                    </div>
                     <div class="ip-controls">
                         <button class="ip-btn fix" onclick="manageIP('${device.mac}', '${device.displayName.replace(/'/g, "\\'")}', '${device.ip}', ${device.ipFixed})">
                             ${device.ipFixed ? 'Change Fixed IP' : 'Fix IP Address'}
                         </button>
                     </div>
-                    <div class="info-row" style="font-size: 8px; color: #999; margin-top: 3px;">
-                        <span class="info-label">Last seen:</span>
-                        <span class="last-update-time">${new Date().toLocaleTimeString()}</span>
+                    ${device.hasMPU6050 ? `
+                    <div class="sensor-data">
+                        <div class="sensor-row">
+                            <span class="sensor-label">Pitch:</span>
+                            <span class="sensor-value">${device.pitch.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-row">
+                            <span class="sensor-label">Roll:</span>
+                            <span class="sensor-value">${device.roll.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-row">
+                            <span class="sensor-label">Yaw:</span>
+                            <span class="sensor-value">${device.yaw.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-row">
+                            <span class="sensor-label">Rel Pitch:</span>
+                            <span class="sensor-value">${device.relPitch.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-row">
+                            <span class="sensor-label">Rel Roll:</span>
+                            <span class="sensor-value">${device.relRoll.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-row">
+                            <span class="sensor-label">Rel Yaw:</span>
+                            <span class="sensor-value">${device.relYaw.toFixed(1)}°</span>
+                        </div>
+                        <div class="sensor-controls">
+                            <button class="sensor-btn calibrate" onclick="calibrateSensor('${device.ip}')">Калибровка</button>
+                            <button class="sensor-btn reset" onclick="resetAngles('${device.ip}')">Reset Angles</button>
+                        </div>
+                        <div class="sensor-row" style="font-size: 8px; color: #999; margin-top: 3px;">
+                            <span class="sensor-label">Last sensor update:</span>
+                            <span class="last-sensor-update">${new Date().toLocaleTimeString()}</span>
+                        </div>
                     </div>
+                    ` : ''}
                 </div>
             `).join('');
         }
         
         function getDeviceIcon(device) {
-            if (device.isVRClient) return '🎮';
+            if (device.hasMPU6050) return '🎮';
             const name = (device.displayName || '').toLowerCase();
             if (name.includes('iphone') || name.includes('ipad')) return '📱';
             if (name.includes('android')) return '📱';
@@ -1636,7 +1952,7 @@ const char htmlPage[] PROGMEM = R"rawliteral(
 </html>
 )rawliteral";
 
-// Обработчик главной страницы
+// Восстанавливаем оригинальный обработчик главной страницы
 void handleRoot() {
   Serial.println("Serving HTML page...");
   server.send_P(200, "text/html", htmlPage);
@@ -1682,6 +1998,68 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             if (commandType == "command") {
               if (command == "get_devices") {
                 sendDevicesListToWebClients();
+              }
+              else if (command == "calibrate") {
+                String deviceIp = doc["ip"];
+                Serial.printf("Calibration command for device: %s\n", deviceIp.c_str());
+                
+                // Находим устройство по IP
+                int deviceIndex = findDeviceByIP(deviceIp.c_str());
+                if (deviceIndex != -1 && devices[deviceIndex].hasMPU6050) {
+                  // Отправляем команду калибровки через WebSocket
+                  bool commandSent = false;
+                  for (int i = 0; i < webSocket.connectedClients(); i++) {
+                    IPAddress clientIp = webSocket.remoteIP(i);
+                    if (clientIp.toString() == deviceIp) {
+                      webSocket.sendTXT(i, "CALIBRATE_SENSOR");
+                      commandSent = true;
+                      Serial.printf("Calibration command sent to %s\n", deviceIp.c_str());
+                      break;
+                    }
+                  }
+                  
+                  if (commandSent) {
+                    String response = "{\"type\":\"command_response\",\"status\":\"success\",\"message\":\"Calibration command sent\"}";
+                    webSocket.sendTXT(num, response);
+                  } else {
+                    String response = "{\"type\":\"command_response\",\"status\":\"error\",\"message\":\"VR device not connected\"}";
+                    webSocket.sendTXT(num, response);
+                  }
+                } else {
+                  String response = "{\"type\":\"command_response\",\"status\":\"error\",\"message\":\"Device not found or not a VR device\"}";
+                  webSocket.sendTXT(num, response);
+                }
+              }
+              else if (command == "reset_angles") {
+                String deviceIp = doc["ip"];
+                Serial.printf("Reset angles command for device: %s\n", deviceIp.c_str());
+                
+                // Находим устройство по IP
+                int deviceIndex = findDeviceByIP(deviceIp.c_str());
+                if (deviceIndex != -1 && devices[deviceIndex].hasMPU6050) {
+                  // Отправляем команду сброса через WebSocket
+                  bool commandSent = false;
+                  for (int i = 0; i < webSocket.connectedClients(); i++) {
+                    IPAddress clientIp = webSocket.remoteIP(i);
+                    if (clientIp.toString() == deviceIp) {
+                      webSocket.sendTXT(i, "RESET_ANGLES");
+                      commandSent = true;
+                      Serial.printf("Reset angles command sent to %s\n", deviceIp.c_str());
+                      break;
+                    }
+                  }
+                  
+                  if (commandSent) {
+                    String response = "{\"type\":\"command_response\",\"status\":\"success\",\"message\":\"Reset command sent\"}";
+                    webSocket.sendTXT(num, response);
+                  } else {
+                    String response = "{\"type\":\"command_response\",\"status\":\"error\",\"message\":\"VR device not connected\"}";
+                    webSocket.sendTXT(num, response);
+                  }
+                } else {
+                  String response = "{\"type\":\"command_response\",\"status\":\"error\",\"message\":\"Device not found or not a VR device\"}";
+                  webSocket.sendTXT(num, response);
+                }
               }
               else if (command == "rename_device") {
                 String mac = doc["mac"];
@@ -1852,25 +2230,41 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
             }
           }
         }
-        // Обработка регистрации VR клиентов
-        else if (message.startsWith("VR_CLIENT_REGISTER:")) {
-          // Формат: "VR_CLIENT_REGISTER:DeviceName"
-          String deviceName = message.substring(19);
-          Serial.printf("VR Client registration: %s from %s\n", deviceName.c_str(), ip.toString().c_str());
+        // Обработка данных от VR-клиентов
+        else if (message.startsWith("DEVICE:")) {
+          char deviceName[32] = "";
+          float pitch = 0, roll = 0, yaw = 0;
+          float relPitch = 0, relRoll = 0, relYaw = 0;
           
-          // Регистрируем VR клиента
-          registerVRClient(ip.toString().c_str(), deviceName.c_str());
-          
-          // Отправляем подтверждение
-          String ackMsg = "REGISTRATION_ACCEPTED:" + deviceName;
-          webSocket.sendTXT(num, ackMsg);
-          
-          // Отправляем обновленный список устройств всем веб-клиентам
-          sendDevicesListToWebClients();
+          // Парсим данные MPU6050
+          if (parseMPU6050Data(message, deviceName, pitch, roll, yaw, relPitch, relRoll, relYaw)) {
+            // Обновляем данные устройства
+            updateVRDeviceData(ip.toString().c_str(), deviceName, pitch, roll, yaw, relPitch, relRoll, relYaw);
+            
+            // Отправляем подтверждение
+            String ackMsg = "DATA_RECEIVED";
+            webSocket.sendTXT(num, ackMsg);
+          } else {
+            Serial.println("Error parsing MPU6050 data");
+            webSocket.sendTXT(num, "ERROR:PARSING_FAILED");
+          }
         }
         else if (message == "PING") {
           String pongMsg = "PONG";
           webSocket.sendTXT(num, pongMsg);
+        }
+        else if (message.startsWith("DEVICE_CONNECTED:")) {
+          // Обработка подключения нового устройства
+          String deviceName = message.substring(17);
+          Serial.printf("VR Device registered: %s from %s\n", deviceName.c_str(), ip.toString().c_str());
+          String welcomeDeviceMsg = "WELCOME:" + deviceName;
+          webSocket.sendTXT(num, welcomeDeviceMsg);
+        }
+        else if (message == "CALIBRATION_COMPLETE") {
+          Serial.printf("[WS %u] Calibration completed\n", num);
+        }
+        else if (message == "ANGLES_RESET") {
+          Serial.printf("[WS %u] Angles reset to zero\n", num);
         }
         else {
           webSocket.sendTXT(num, "ERROR:UNKNOWN_COMMAND");
@@ -1884,7 +2278,36 @@ void webSocketEvent(uint8_t num, WStype_t type, uint8_t * payload, size_t length
   }
 }
 
-// Настройка WiFi точки доступа
+// Восстанавливаем функцию парсинга данных MPU6050
+bool parseMPU6050Data(const String& message, char* deviceName, 
+                     float& pitch, float& roll, float& yaw,
+                     float& relPitch, float& relRoll, float& relYaw) {
+  // Пример формата: "DEVICE:VR-Head-Hom-001,PITCH:13.3,ROLL:5.7,YAW:-9.7,REL_PITCH:13.30,REL_ROLL:5.68,REL_YAW:-9.70,ACC_PITCH:13.30,ACC_ROLL:5.68,ACC_YAW:-9.70,ZERO_SET:false,TIMESTAMP:237540"
+  
+  if (!message.startsWith("DEVICE:")) {
+    return false;
+  }
+  
+  // Разбиваем сообщение на части
+  int startPos = 7; // После "DEVICE:"
+  int endPos = message.indexOf(',', startPos);
+  if (endPos == -1) return false;
+  
+  String deviceNameStr = message.substring(startPos, endPos);
+  safeStrcpy(deviceName, deviceNameStr.c_str(), 32);
+  
+  // Парсим основные значения
+  pitch = extractValue(message, "PITCH:");
+  roll = extractValue(message, "ROLL:");
+  yaw = extractValue(message, "YAW:");
+  relPitch = extractValue(message, "REL_PITCH:");
+  relRoll = extractValue(message, "REL_ROLL:");
+  relYaw = extractValue(message, "REL_YAW:");
+  
+  return true;
+}
+
+// Восстанавливаем оригинальную настройку WiFi
 void setupWiFiAP() {
   Serial.println("Setting up Access Point...");
   
@@ -1913,7 +2336,7 @@ void setup() {
   Serial.begin(115200);
   delay(1000);
   
-  Serial.println("\nStarting ESP8266 Network Monitor...");
+  Serial.println("\nStarting VR Tracking Server...");
   
   // Загрузка настроек сети из EEPROM
   loadNetworkSettingsFromEEPROM();
@@ -1929,6 +2352,10 @@ void setup() {
   
   // Настройка маршрутов сервера с CORS поддержкой
   server.on("/", handleRoot);
+  server.on("/api/calibrate", HTTP_POST, handleApiCalibrate);
+  server.on("/api/calibrate", HTTP_OPTIONS, handleOptions);
+  server.on("/api/reset", HTTP_POST, handleApiReset);
+  server.on("/api/reset", HTTP_OPTIONS, handleOptions);
   server.on("/api/rename", HTTP_POST, handleApiRename);
   server.on("/api/rename", HTTP_OPTIONS, handleOptions);
   server.on("/api/fixip", HTTP_POST, handleApiFixIP);
@@ -1948,7 +2375,7 @@ void setup() {
   Serial.println("HTTP server started on port 80");
   Serial.println("WebSocket server for all clients started on port 81");
   Serial.println("DHCP server started on port 67");
-  Serial.println("Ready to receive VR client registrations!");
+  Serial.println("Ready to receive MPU6050 data from VR headsets!");
   
   // Первое сканирование
   scanNetwork();

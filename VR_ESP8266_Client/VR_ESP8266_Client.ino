@@ -1248,7 +1248,7 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             <h1>VR Head Tracker - MPU6050 Sensor Data</h1>
             <p>Real-time 3D orientation visualization and network monitoring</p>
             <p><strong>Access Point:</strong> <span id="ap-name">VR_Head_Hom_001</span></p>
-            <br/><button class="btn-info" onclick="showSettings()">Network Settings</button>
+            <button class="btn-info" onclick="showSettings()">Network Settings</button>
         </div>
         
         <div class="stats">
@@ -1746,15 +1746,13 @@ const char MAIN_page[] PROGMEM = R"rawliteral(
             }
         }
         
-        function showSettings() {
-            loadCurrentSettings();
-            document.getElementById('settings-modal').style.display = 'block';
-        }
-        
-        function hideSettings() {
-            document.getElementById('settings-modal').style.display = 'none';
-        }
-        
+function showSettings() {
+    loadCurrentSettings();
+    document.getElementById('settings-modal').style.display = 'block';
+}
+function hideSettings() {
+    document.getElementById('settings-modal').style.display = 'none';
+}
         function showTab(tabId) {
             // Hide all tabs
             var tabs = document.querySelectorAll('.tab-content');

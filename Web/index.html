@@ -419,13 +419,42 @@
                     <div class="data-label">Относительный Yaw</div>
                     <div class="data-value" id="relYaw">0.00°</div>
                 </div>
+                <div class="data-item">
+                    <div class="data-label">Accel Pitch</div>
+                    <div class="data-value" id="accPitch">0.00°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Accel Roll</div>
+                    <div class="data-value" id="accRoll">0.00°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Accel Yaw</div>
+                    <div class="data-value" id="accYaw">0.00°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Zero Set</div>
+                    <div class="data-value" id="zeroSet">false</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Zero Pitch</div>
+                    <div class="data-value" id="zeroPitch">0.00°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Zero Roll</div>
+                    <div class="data-value" id="zeroRoll">0.00°</div>
+                </div>
+                <div class="data-item">
+                    <div class="data-label">Zero Yaw</div>
+                    <div class="data-value" id="zeroYaw">0.00°</div>
+                </div>
             </div>
             
             <div class="axis-info">
                 <h3>Соответствие осей:</h3>
-                <p>• <strong>Pitch (X)</strong> - Наклон вперед/назад (кивок головой)</p>
-                <p>• <strong>Roll (Y)</strong> - Наклон к плечам влево/вправо</p>
-                <p>• <strong>Yaw (Z)</strong> - Поворот головы влево/вправо</p>
+                <p>• <strong>Pitch (X)</strong> - Наклон вперед/назад (кивок головой) → rotateX()</p>
+                <p>• <strong>Roll (Y)</strong> - Наклон к плечам влево/вправо → rotateZ()</p>
+                <p>• <strong>Yaw (Z)</strong> - Поворот головы влево/вправо → rotateY()</p>
+                <p style="margin-top: 10px; color: #90ee90;"><strong>Порядок вращения:</strong> Yaw → Pitch → Roll</p>
             </div>
             
             <div class="controls">
@@ -457,6 +486,13 @@
         const relPitch = document.getElementById('relPitch');
         const relRoll = document.getElementById('relRoll');
         const relYaw = document.getElementById('relYaw');
+        const accPitch = document.getElementById('accPitch');
+        const accRoll = document.getElementById('accRoll');
+        const accYaw = document.getElementById('accYaw');
+        const zeroSet = document.getElementById('zeroSet');
+        const zeroPitch = document.getElementById('zeroPitch');
+        const zeroRoll = document.getElementById('zeroRoll');
+        const zeroYaw = document.getElementById('zeroYaw');
         const resetBtn = document.getElementById('resetBtn');
         const calibrateBtn = document.getElementById('calibrateBtn');
         const connectBtn = document.getElementById('connectBtn');
@@ -470,8 +506,8 @@
         function connectWebSocket() {
             // Получаем IP ESP8266 из URL или используем локальный хост
             const urlParams = new URLSearchParams(window.location.search);
-            //const espIp = urlParams.get('ip') || window.location.hostname || '192.168.4.1';
-            const espIp = '192.168.5.1';
+            //const espIp = urlParams.get('ip') || '192.168.4.1';
+			const espIp = '192.168.5.1';
             const wsUrl = `ws://${espIp}:81/`;
             
             connectionStatus.textContent = 'Подключение...';
@@ -521,44 +557,75 @@
         
         // Функция обработки данных с сенсора
         function handleSensorData(data) {
-            // Проверяем, содержит ли данные MPU6050
-            if (data.includes('PITCH:') && data.includes('ROLL:') && data.includes('YAW:')) {
-                // Извлекаем значения углов
-                const pitchMatch = data.match(/PITCH:([-\d.]+)/);
-                const rollMatch = data.match(/ROLL:([-\d.]+)/);
-                const yawMatch = data.match(/YAW:([-\d.]+)/);
-                const relPitchMatch = data.match(/REL_PITCH:([-\d.]+)/);
-                const relRollMatch = data.match(/REL_ROLL:([-\d.]+)/);
-                const relYawMatch = data.match(/REL_YAW:([-\d.]+)/);
-                
-                if (pitchMatch && rollMatch && yawMatch) {
-                    const pitch = parseFloat(pitchMatch[1]);
-                    const roll = parseFloat(rollMatch[1]);
-                    const yaw = parseFloat(yawMatch[1]);
+            try {
+                // Проверяем, содержит ли данные MPU6050 в текстовом формате
+                if (data.includes('PITCH:') && data.includes('ROLL:') && data.includes('YAW:')) {
+                    // Создаем объект для хранения данных
+                    const sensorData = {};
+                    
+                    // Разбиваем данные по запятым и обрабатываем каждую пару ключ-значение
+                    const pairs = data.split(',');
+                    pairs.forEach(pair => {
+                        const [key, value] = pair.split(':');
+                        if (key && value !== undefined) {
+                            // Преобразуем значение в число, если это возможно
+                            const numValue = parseFloat(value);
+                            sensorData[key.trim()] = isNaN(numValue) ? value.trim() : numValue;
+                        }
+                    });
                     
                     // Обновляем значения на экране
-                    pitchValue.textContent = pitch.toFixed(2) + '°';
-                    rollValue.textContent = roll.toFixed(2) + '°';
-                    yawValue.textContent = yaw.toFixed(2) + '°';
+                    if (sensorData.PITCH !== undefined) {
+                        pitchValue.textContent = sensorData.PITCH.toFixed(2) + '°';
+                    }
+                    if (sensorData.ROLL !== undefined) {
+                        rollValue.textContent = sensorData.ROLL.toFixed(2) + '°';
+                    }
+                    if (sensorData.YAW !== undefined) {
+                        yawValue.textContent = sensorData.YAW.toFixed(2) + '°';
+                    }
+                    if (sensorData.REL_PITCH !== undefined) {
+                        relPitch.textContent = sensorData.REL_PITCH.toFixed(2) + '°';
+                    }
+                    if (sensorData.REL_ROLL !== undefined) {
+                        relRoll.textContent = sensorData.REL_ROLL.toFixed(2) + '°';
+                    }
+                    if (sensorData.REL_YAW !== undefined) {
+                        relYaw.textContent = sensorData.REL_YAW.toFixed(2) + '°';
+                    }
+                    if (sensorData.ACC_PITCH !== undefined) {
+                        accPitch.textContent = sensorData.ACC_PITCH.toFixed(2) + '°';
+                    }
+                    if (sensorData.ACC_ROLL !== undefined) {
+                        accRoll.textContent = sensorData.ACC_ROLL.toFixed(2) + '°';
+                    }
+                    if (sensorData.ACC_YAW !== undefined) {
+                        accYaw.textContent = sensorData.ACC_YAW.toFixed(2) + '°';
+                    }
+                    if (sensorData.ZERO_SET !== undefined) {
+                        zeroSet.textContent = sensorData.ZERO_SET.toString();
+                    }
+                    if (sensorData.ZERO_PITCH !== undefined) {
+                        zeroPitch.textContent = sensorData.ZERO_PITCH.toFixed(2) + '°';
+                    }
+                    if (sensorData.ZERO_ROLL !== undefined) {
+                        zeroRoll.textContent = sensorData.ZERO_ROLL.toFixed(2) + '°';
+                    }
+                    if (sensorData.ZERO_YAW !== undefined) {
+                        zeroYaw.textContent = sensorData.ZERO_YAW.toFixed(2) + '°';
+                    }
                     
-                    // Обновляем относительные углы, если они есть
-                    if (relPitchMatch) {
-                        relPitch.textContent = parseFloat(relPitchMatch[1]).toFixed(2) + '°';
+                    // Обновляем 3D модель VR-головы
+                    if (sensorData.PITCH !== undefined && sensorData.ROLL !== undefined && sensorData.YAW !== undefined) {
+                        updateVRHead(sensorData.PITCH, sensorData.ROLL, sensorData.YAW);
                     }
-                    if (relRollMatch) {
-                        relRoll.textContent = parseFloat(relRollMatch[1]).toFixed(2) + '°';
-                    }
-                    if (relYawMatch) {
-                        relYaw.textContent = parseFloat(relYawMatch[1]).toFixed(2) + '°';
-                    }
-                    
-                    // Обновляем 3D модель VR-головы с правильным соответствием осей
-                    updateVRHead(pitch, roll, yaw);
                 }
+            } catch (error) {
+                console.error('Ошибка обработки данных:', error, 'Данные:', data);
             }
         }
         
-        // Функция обновления 3D модели VR-головы с правильной логикой осей
+        // Функция обновления 3D модели VR-головы с правильным порядком вращения
         function updateVRHead(pitch, roll, yaw) {
             /*
             Правильное соответствие осей для VR-головы:
@@ -566,14 +633,19 @@
             - Roll (Y): Наклон к плечам влево/вправо → вращение вокруг оси Z
             - Yaw (Z): Поворот головы влево/вправо → вращение вокруг оси Y
             
-            В 3D CSS:
-            - rotateX() - наклон вперед/назад (Pitch)
-            - rotateY() - поворот головы (Yaw)  
-            - rotateZ() - наклон к плечам (Roll)
+            Правильный порядок вращения для корректного отображения:
+            1. Сначала Yaw (поворот головы) - rotateY()
+            2. Затем Pitch (наклон вперед/назад) - rotateX()  
+            3. Наконец Roll (наклон вбок) - rotateZ()
+            
+            В 3D CSS порядок важен - вращения применяются справа налево
             */
             
-            // Применяем вращение к VR-голове с правильным соответствием осей
-            vrHead.style.transform = `rotateX(${pitch}deg) rotateY(${yaw}deg) rotateZ(${roll}deg)`;
+            // Применяем вращение к VR-голове с правильным порядком
+            vrHead.style.transform = `rotateY(${yaw}deg) rotateX(${pitch}deg) rotateZ(${roll}deg)`;
+            
+            // Для отладки выводим текущие значения
+            console.log(`Yaw: ${yaw.toFixed(2)}°, Pitch: ${pitch.toFixed(2)}°, Roll: ${roll.toFixed(2)}°`);
         }
         
         // Функция отправки команды
